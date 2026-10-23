@@ -3,11 +3,24 @@ import SwiftUI
 import PhotoCore
 
 @MainActor @Observable final class BrowserModel {
-    var folder: URL?
+    enum Location: Equatable {
+        case folder(URL), library(URL)
+        var url: URL { switch self { case .folder(let url), .library(let url): url } }
+    }
+    private(set) var location: Location?
+    var folder: URL? { location?.url }
+    var isLibrary: Bool { if case .library = location { true } else { false } }
+    var libraryRoot: URL? = UserDefaults.standard.url(forKey: "libraryRoot")
+    private var library: PhotoLibrary?
+    var busy = false
+    var operationTitle = ""
+    var canTrash: Bool { selected?.asset != nil && !busy && !loading }
+    var canUp: Bool { !busy && !isLibrary && folder != nil && folder?.path != "/" }
     var entries: [CatalogEntry] = []
     var selection = SelectionState()
     var loading = false
     var error: String?
+    var catalogIssues: [String] = []
     var preview: RenderedImage?
     var previewError: String?
     var previewLoading = false
@@ -23,7 +36,7 @@ import PhotoCore
     }
     var sort: CatalogSort = CatalogSort(rawValue: UserDefaults.standard.string(forKey: "sort") ?? "") ?? .name
     var ascending = UserDefaults.standard.object(forKey: "ascending") as? Bool ?? true
-    private var history: [URL] = []
+    private var history: [Location] = []
     private var historyIndex = -1
     private var folderRevision = 0
     private var previewTask: Task<Void, Never>?
@@ -45,47 +58,156 @@ import PhotoCore
     var canBack: Bool { historyIndex > 0 }
     var canForward: Bool { historyIndex + 1 < history.count }
     var ancestors: [URL] {
-        guard var url = folder else { return [] }
+        guard !isLibrary, var url = folder else { return [] }
         var result = [url]
         while url.path != "/" { url.deleteLastPathComponent(); result.insert(url, at: 0) }
         return result
     }
     func chooseFolder() {
+        guard !busy else { return }
         let panel = NSOpenPanel(); panel.canChooseDirectories = true; panel.canChooseFiles = false
         panel.allowsMultipleSelection = false; panel.prompt = "Открыть"; panel.message = "Выберите папку с фотографиями"
         if panel.runModal() == .OK, let url = panel.url { open(url) }
     }
     func open(_ url: URL, recordHistory: Bool = true) {
-        if recordHistory && folder != url {
-            history = Array(history.prefix(historyIndex + 1)); history.append(url); historyIndex = history.count - 1
+        navigate(.folder(url), recordHistory: recordHistory)
+    }
+    private func navigate(_ destination: Location, recordHistory: Bool = true) {
+        guard !busy else { return }
+        if recordHistory && location != destination {
+            history = Array(history.prefix(historyIndex + 1)); history.append(destination); historyIndex = history.count - 1
         }
-        let changed = folder != url
-        folder = url
-        if changed { entries = []; select(nil) }
+        let changed = location != destination
+        location = destination
+        if case .library(let root) = destination {
+            if library?.root != root { library = PhotoLibrary(root: root) }
+        }
+        if changed { entries = []; catalogIssues = []; select(nil) }
         reload()
     }
-    func back() { guard canBack else { return }; historyIndex -= 1; open(history[historyIndex], recordHistory: false) }
-    func forward() { guard canForward else { return }; historyIndex += 1; open(history[historyIndex], recordHistory: false) }
-    func up() { guard let folder, folder.path != "/" else { return }; open(folder.deletingLastPathComponent()) }
+    func back() { guard !busy, canBack else { return }; historyIndex -= 1; navigate(history[historyIndex], recordHistory: false) }
+    func forward() { guard !busy, canForward else { return }; historyIndex += 1; navigate(history[historyIndex], recordHistory: false) }
+    func up() { guard canUp, let folder else { return }; open(folder.deletingLastPathComponent()) }
     func reload() {
-        guard let folder else { return }
+        guard !busy else { return }
+        Task { await refresh() }
+    }
+    private func refresh(nearest index: Int? = nil) async {
+        guard let location else { return }
         folderRevision += 1; let revision = folderRevision
         loading = true; error = nil
         let source = catalog
+        do {
+            let contents: [CatalogEntry]
+            var issues: [String] = []
+            switch location {
+            case .folder(let folder): contents = try await Task.detached { try source.contents(of: folder) }.value
+            case .library(let root):
+                if library?.root != root { library = PhotoLibrary(root: root) }
+                let snapshot = try await library!.snapshot()
+                contents = snapshot.entries; issues = snapshot.issues
+            }
+            guard revision == folderRevision else { return }
+            catalogIssues = issues
+            entries = FolderCatalog.sorted(contents, by: sort, ascending: ascending)
+            loading = false
+            if !entries.contains(where: { $0.id == selection.id }) {
+                let survivor = photos.isEmpty ? nil : photos[min(index ?? 0, photos.count - 1)].id
+                select(survivor)
+            } else { loadPreview() }
+        } catch {
+            guard revision == folderRevision else { return }
+            entries = []; catalogIssues = []; select(nil); loading = false
+            self.error = "Папка недоступна. Проверьте подключение носителя и права доступа.\n\(error.localizedDescription)"
+        }
+    }
+    @discardableResult func chooseLibrary() -> Bool {
+        guard !busy else { return false }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true; panel.canChooseFiles = false; panel.canCreateDirectories = true
+        panel.prompt = "Выбрать библиотеку"
+        panel.message = "Выберите или создайте папку для библиотеки. Здесь будут храниться копии фотографий, независимо от SD-карты."
+        guard panel.runModal() == .OK, let root = panel.url else { return false }
+        libraryRoot = root; UserDefaults.standard.set(root, forKey: "libraryRoot")
+        navigate(.library(root)); return true
+    }
+    func openLibrary() {
+        guard !busy else { return }
+        if let libraryRoot { navigate(.library(libraryRoot)) } else { chooseLibrary() }
+    }
+    func chooseImport() {
+        guard !busy else { return }
+        if libraryRoot == nil && !chooseLibrary() { return }
+        guard let root = libraryRoot else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true; panel.canChooseFiles = false
+        panel.prompt = "Импортировать"
+        panel.message = "Выберите SD-карту или папку с фотографиями. JPG и RAF будут скопированы с сохранением оригиналов, включая вложенные папки."
+        guard panel.runModal() == .OK, let source = panel.url else { return }
+        let target: PhotoLibrary
+        if let library, library.root == root { target = library }
+        else { target = PhotoLibrary(root: root); library = target }
+        beginOperation("Импорт фотографий…")
         Task {
             do {
-                let contents = try await Task.detached { try source.contents(of: folder) }.value
-                guard revision == folderRevision else { return }
-                entries = FolderCatalog.sorted(contents, by: sort, ascending: ascending)
-                loading = false
-                if !entries.contains(where: { $0.id == selection.id }) { select(photos.first?.id) }
-                else { loadPreview() }
+                let report = try await target.importPhotos(from: source)
+                busy = false; loadPreview()
+                if location == .library(root) { await refresh() }
+                let alert = NSAlert()
+                alert.messageText = "Импорт завершён"
+                alert.informativeText = "Добавлено файлов: \(report.imported). Пропущено: \(report.skipped)." + (report.issues.isEmpty ? "" : "\n\n" + Self.summarizeIssues(report.issues))
+                alert.addButton(withTitle: "Открыть библиотеку"); alert.addButton(withTitle: "Закрыть")
+                if alert.runModal() == .alertFirstButtonReturn { navigate(.library(root)) }
             } catch {
-                guard revision == folderRevision else { return }
-                entries = []; select(nil); loading = false
-                self.error = "Папка недоступна. Проверьте подключение носителя и права доступа.\n\(error.localizedDescription)"
+                busy = false; loadPreview()
+                showMessage("Не удалось импортировать", error.localizedDescription)
+                if location == .library(root) { await refresh() }
             }
         }
+    }
+    func confirmTrash() {
+        guard canTrash, let asset = selected?.asset, location != nil else { return }
+        let alert = NSAlert(); alert.alertStyle = .warning
+        alert.messageText = "Переместить снимок в Корзину?"
+        alert.informativeText = "Будут перемещены все файлы снимка:\n" + asset.resources.map { $0.url.lastPathComponent }.joined(separator: "\n")
+        alert.addButton(withTitle: "В Корзину"); alert.addButton(withTitle: "Отмена")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let index = photos.firstIndex { $0.id == asset.id } ?? 0
+        let managedRoot: URL?
+        if case .library(let root)? = location { managedRoot = root } else { managedRoot = libraryRoot }
+        let target = managedRoot.map { root in library?.root == root ? library! : PhotoLibrary(root: root) }
+        beginOperation("Перемещение в Корзину…")
+        Task {
+            do {
+                let report: TrashReport
+                if let target, asset.resources.allSatisfy({ $0.url.standardizedFileURL.path.hasPrefix(target.root.standardizedFileURL.path + "/") }) { report = try await target.trash(asset) }
+                else { report = await Task.detached { PhotoTrash.trash(asset) }.value }
+                busy = false
+                await refresh(nearest: index)
+                if !report.failures.isEmpty {
+                    showMessage("Не все файлы перемещены в Корзину", "Перемещено: \(report.trashed.count).\n" + report.failures.joined(separator: "\n"))
+                }
+            } catch {
+                busy = false; await refresh(nearest: index)
+                showMessage("Не удалось переместить в Корзину", error.localizedDescription)
+            }
+        }
+    }
+    private func beginOperation(_ title: String) {
+        busy = true; operationTitle = title
+        folderRevision += 1; loading = false
+        previewTask?.cancel(); prefetchTask?.cancel()
+    }
+    func showCatalogIssues() {
+        showMessage("Некоторые файлы библиотеки недоступны", Self.summarizeIssues(catalogIssues))
+    }
+    static func summarizeIssues(_ issues: [String]) -> String {
+        let visible = issues.prefix(12).joined(separator: "\n")
+        return visible + (issues.count > 12 ? "\nИ ещё: \(issues.count - 12)." : "")
+    }
+    private func showMessage(_ title: String, _ detail: String) {
+        let alert = NSAlert(); alert.messageText = title; alert.informativeText = detail
+        alert.addButton(withTitle: "OK"); alert.runModal()
     }
     func setSort(_ field: CatalogSort) {
         if sort == field { ascending.toggle() } else { sort = field; ascending = true }
@@ -93,6 +215,7 @@ import PhotoCore
         entries = FolderCatalog.sorted(entries, by: sort, ascending: ascending)
     }
     func select(_ id: String?) {
+        guard !busy else { return }
         guard selection.id != id else { return }
         selection.select(id); viewport = ViewportState(); loadPreview()
     }
@@ -109,6 +232,7 @@ import PhotoCore
         select(photos[min(max(current + delta, 0), photos.count - 1)].id)
     }
     func toggleRAW() {
+        guard !busy else { return }
         guard selected?.asset?.isPair == true else { return }
         selection.toggleRAW(); viewport = ViewportState(); loadPreview()
     }

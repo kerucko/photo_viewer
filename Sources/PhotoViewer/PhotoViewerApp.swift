@@ -32,25 +32,133 @@ import PhotoCore
             }
             CommandGroup(replacing: .newItem) {
                 Button("Открыть папку…") { model.chooseFolder() }.keyboardShortcut("o")
-                Button("Обновить") { model.reload() }.keyboardShortcut("r")
+                Button("Открыть библиотеку…") { model.chooseLibrary() }.disabled(model.busy)
+                Button("Библиотека") { model.openLibrary() }.disabled(model.busy)
+                Button("Импортировать с SD…") { model.chooseImport() }.disabled(model.busy)
+                Divider()
+                Button("Переместить снимок в Корзину…") { model.confirmTrash() }
+                    .keyboardShortcut(.delete, modifiers: .command).disabled(!model.canTrash)
+                Button("Обновить") { model.reload() }.keyboardShortcut("r").disabled(model.busy)
             }
         }
+    }
+}
+
+/// Owns its group backgrounds and spacing so macOS cannot merge adjacent toolbar items.
+struct NavigationToolbarView: View {
+    @Bindable var model: BrowserModel
+    var compact: Bool
+
+    private var folderName: String {
+        guard let folder = model.folder else { return "Фото" }
+        return folder.lastPathComponent.isEmpty ? "/" : folder.lastPathComponent
+    }
+
+    private func group<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        content()
+            .padding(.horizontal, 10)
+            .frame(height: 34)
+            .background(.regularMaterial, in: Capsule())
+            .overlay(Capsule().strokeBorder(.primary.opacity(0.12), lineWidth: 0.5))
+    }
+
+    private func navigationButton(_ symbol: String, title: String, disabled: Bool,
+                                  action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .frame(width: 26, height: 30)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
+        .help(title)
+        .accessibilityLabel(title)
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            group {
+                HStack(spacing: 8) {
+                    navigationButton("chevron.left", title: "Назад", disabled: model.busy || !model.canBack, action: model.back)
+                    navigationButton("chevron.right", title: "Вперёд", disabled: model.busy || !model.canForward, action: model.forward)
+                    navigationButton("arrow.up", title: "На уровень выше", disabled: model.busy || !model.canUp, action: model.up)
+                }
+            }
+            group {
+                navigationButton("folder.badge.plus", title: "Открыть папку", disabled: model.busy, action: model.chooseFolder)
+            }
+            group {
+                HStack(spacing: 8) {
+                    Image(systemName: model.isLibrary ? "photo.stack" : "folder")
+                        .foregroundStyle(.secondary)
+                    Text(folderName)
+                        .lineLimit(1).truncationMode(.middle)
+                        .frame(maxWidth: compact ? 100 : 180, alignment: .leading)
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+                .help(model.folder?.path ?? "Выберите папку с фотографиями")
+            }
+            group {
+                HStack(spacing: 8) {
+                    if model.loading || model.busy {
+                        ProgressView().controlSize(.small)
+                            .help(model.busy ? model.operationTitle : "Загрузка папки…")
+                    }
+                    Text(model.busy ? model.operationTitle : "\(model.photos.count) фото")
+                        .foregroundStyle(.secondary).lineLimit(1)
+                        .frame(maxWidth: compact ? 90 : 160, alignment: .leading)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .help(model.busy ? model.operationTitle : "\(model.photos.count) фото")
+                }
+            }
+        }
+        .font(.callout)
+        .fixedSize(horizontal: true, vertical: false)
     }
 }
 
 struct BrowserView: View {
     @Bindable var model: BrowserModel
     @State private var keyMonitor: Any?
+    @State private var contentWidth: CGFloat = 0
+    private var compactToolbar: Bool { contentWidth < 1150 }
+    private var viewModePicker: some View {
+        Picker("Вид", selection: $model.mode) {
+            Label("Значки", systemImage: "square.grid.2x2").tag(ViewMode.icons)
+            Label("Список", systemImage: "list.bullet").tag(ViewMode.list)
+            Label("Колонки", systemImage: "rectangle.split.3x1").tag(ViewMode.columns)
+            Label("Галерея", systemImage: "rectangle.bottomthird.inset.filled").tag(ViewMode.gallery)
+        }
+    }
+
+    private var viewModeSymbol: String {
+        switch model.mode {
+        case .icons: "square.grid.2x2"
+        case .list: "list.bullet"
+        case .columns: "rectangle.split.3x1"
+        case .gallery: "rectangle.bottomthird.inset.filled"
+        }
+    }
+
+    @ToolbarContentBuilder
+    private var navigationToolbar: some ToolbarContent {
+        ToolbarItem(placement: .navigation) {
+            NavigationToolbarView(model: model, compact: compactToolbar)
+        }
+        .sharedBackgroundVisibility(.hidden)
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                Image(systemName: "folder").foregroundStyle(.secondary)
-                Text(model.folder?.path ?? "Выберите папку с фотографиями").lineLimit(1).truncationMode(.head)
-                Spacer()
-                if model.loading { ProgressView().controlSize(.small) }
-                Text("\(model.photos.count) фото").foregroundStyle(.secondary)
-            }.font(.callout).padding(.horizontal, 16).padding(.vertical, 9)
-            Divider()
+            if !model.catalogIssues.isEmpty {
+                HStack {
+                    Label("Недоступные файлы: \(model.catalogIssues.count). Остальные фотографии доступны.", systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.secondary).lineLimit(2)
+                    Spacer()
+                    Button("Подробнее…") { model.showCatalogIssues() }
+                }.font(.callout).padding(10)
+                Divider()
+            }
             if let error = model.error {
                 ContentUnavailableView { Label("Папка недоступна", systemImage: "externaldrive.badge.exclamationmark") } description: { Text(error) } actions: { Button("Повторить") { model.reload() } }
             } else if model.folder == nil {
@@ -66,48 +174,103 @@ struct BrowserView: View {
                     Text("В папке нет JPG, RAF или вложенных папок").foregroundStyle(.secondary).padding()
                 }
             }
-            Divider()
-            HStack {
-                Text(model.selected?.name ?? "Нет выделения").lineLimit(1)
-                Spacer()
-                if model.selected?.asset?.isPair == true {
-                    Button(model.selection.showsRAW ? "RAW → JPG" : "JPG → RAW") { model.toggleRAW() }
-                        .help("Переключить JPEG и проявленный RAW")
-                } else if let asset = model.selected?.asset { Text(asset.kind).foregroundStyle(.secondary) }
-            }.font(.callout).padding(10)
+            if model.mode != .gallery {
+                Divider()
+                HStack {
+                    Text(model.selected?.name ?? "Нет выделения").lineLimit(1)
+                    Spacer()
+                    if model.selected?.asset?.isPair == true {
+                        Button(model.selection.showsRAW ? "RAW → JPG" : "JPG → RAW") { model.toggleRAW() }
+                            .help("Переключить JPEG и проявленный RAW")
+                    } else if let asset = model.selected?.asset { Text(asset.kind).foregroundStyle(.secondary) }
+                }.font(.callout).padding(10)
+            }
         }
+        .disabled(model.busy)
         .inspector(isPresented: $model.showMetadata) {
             MetadataSidebar(entry: model.selected, resource: model.selectedResource)
                 .inspectorColumnWidth(min: 240, ideal: 280, max: 380)
         }
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { contentWidth = $0 }
+        .navigationTitle("")
         .toolbar {
-            ToolbarItemGroup(placement: .navigation) {
-                Button(action: model.back) { Image(systemName: "chevron.left") }.disabled(!model.canBack).help("Назад")
-                Button(action: model.forward) { Image(systemName: "chevron.right") }.disabled(!model.canForward).help("Вперёд")
-                Button(action: model.up) { Image(systemName: "arrow.up") }.disabled(model.folder == nil || model.folder?.path == "/").help("На уровень выше")
-                Button(action: model.chooseFolder) { Image(systemName: "folder.badge.plus") }.help("Открыть папку")
-            }
+            navigationToolbar
             ToolbarItem(placement: .principal) {
-                Picker("Вид", selection: $model.mode) {
-                    Label("Значки", systemImage: "square.grid.2x2").tag(ViewMode.icons)
-                    Label("Список", systemImage: "list.bullet").tag(ViewMode.list)
-                    Label("Колонки", systemImage: "rectangle.split.3x1").tag(ViewMode.columns)
-                    Label("Галерея", systemImage: "rectangle.bottomthird.inset.filled").tag(ViewMode.gallery)
-                }.pickerStyle(.segmented).frame(width: 220)
+                if compactToolbar {
+                    Menu {
+                        viewModePicker
+                    } label: {
+                        Label("Вид", systemImage: viewModeSymbol)
+                    }.disabled(model.busy).help("Режим просмотра")
+                } else {
+                    viewModePicker.pickerStyle(.segmented).frame(width: 180).disabled(model.busy)
+                }
             }
-            ToolbarItemGroup {
-                if model.mode == .icons { Slider(value: $model.iconSize, in: 100...240).frame(width: 100).help("Размер значков") }
+            if model.mode == .gallery {
+                ToolbarItem {
+                    if model.selected?.asset?.isPair == true {
+                        Button(model.selection.showsRAW ? "RAW → JPG" : "JPG → RAW") { model.toggleRAW() }
+                            .disabled(model.busy).help("Переключить JPEG и проявленный RAW")
+                    } else if let asset = model.selected?.asset {
+                        Text(asset.kind).foregroundStyle(.secondary)
+                    }
+                }
+                if compactToolbar {
+                    ToolbarItem {
+                        Menu {
+                            Button("Вписать в окно") { model.viewport = ViewportState() }
+                            Button("Реальный размер (100%)") { model.viewport = ViewportState(scale: 1) }
+                            Divider()
+                            Button("Уменьшить") { model.viewport.zoom(by: 1 / 1.4) }
+                            Button("Увеличить") { model.viewport.zoom(by: 1.4) }
+                        } label: {
+                            Label("Масштаб", systemImage: "magnifyingglass")
+                        }
+                        .disabled(model.busy || !model.canZoom)
+                        .help("Масштаб: вписать, 100%, уменьшить или увеличить")
+                    }
+                } else {
+                    ToolbarItemGroup {
+                        Button("Вписать") { model.viewport = ViewportState() }
+                            .disabled(model.busy || !model.canZoom)
+                        Button("100%") { model.viewport = ViewportState(scale: 1) }
+                            .disabled(model.busy || !model.canZoom)
+                        Button { model.viewport.zoom(by: 1 / 1.4) } label: {
+                            Label("Уменьшить", systemImage: "minus.magnifyingglass")
+                        }.disabled(model.busy || !model.canZoom)
+                        Button { model.viewport.zoom(by: 1.4) } label: {
+                            Label("Увеличить", systemImage: "plus.magnifyingglass")
+                        }.disabled(model.busy || !model.canZoom)
+                    }
+                }
+            }
+            if model.mode == .icons {
+                ToolbarItem {
+                    Slider(value: $model.iconSize, in: 100...240).frame(width: 100).disabled(model.busy).help("Размер значков")
+                }
+            }
+            ToolbarItem {
                 Menu {
                     Button("Имя") { model.setSort(.name) }
                     Button("Тип") { model.setSort(.kind) }
                     Button("Дата изменения") { model.setSort(.modified) }
                     Button("Размер") { model.setSort(.size) }
-                } label: { Image(systemName: "arrow.up.arrow.down") }
-                Button(action: model.reload) { Image(systemName: "arrow.clockwise") }.help("Обновить")
-                Button { model.showMetadata.toggle() } label: { Image(systemName: "sidebar.right") }
-                    .help("Показать или скрыть сведения (⌘I)")
+                } label: { Label("Сортировка", systemImage: "arrow.up.arrow.down") }
+                .disabled(model.busy)
+            }
+            ToolbarItem {
+                Button(action: model.confirmTrash) { Label("В Корзину", systemImage: "trash") }
+                    .disabled(model.busy || !model.canTrash).help("Переместить все файлы снимка в Корзину (⌘⌫)")
+            }
+            ToolbarItem {
+                Button(action: model.reload) { Label("Обновить", systemImage: "arrow.clockwise") }.disabled(model.busy).help("Обновить")
+            }
+            ToolbarItem {
+                Button { model.showMetadata.toggle() } label: { Label("Сведения", systemImage: "sidebar.right") }
+                    .disabled(model.busy).help("Показать или скрыть сведения (⌘I)")
             }
         }
+
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
             guard let provider = providers.first else { return false }
             _ = provider.loadObject(ofClass: URL.self) { url, _ in
@@ -118,7 +281,7 @@ struct BrowserView: View {
         }
         .onAppear {
             keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-                guard NSApp.keyWindow != nil, NSApp.modalWindow == nil, !(NSApp.keyWindow?.firstResponder is NSTextView), event.modifierFlags.intersection([.command, .control, .option]).isEmpty else { return event }
+                guard !model.busy, NSApp.keyWindow != nil, NSApp.modalWindow == nil, !(NSApp.keyWindow?.firstResponder is NSTextView), event.modifierFlags.intersection([.command, .control, .option]).isEmpty else { return event }
                 switch event.keyCode {
                 case 123: model.step(-1); return nil
                 case 124: model.step(1); return nil
@@ -153,14 +316,6 @@ struct GalleryView: View {
     @Bindable var model: BrowserModel
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                Text(model.selection.showsRAW || model.selected?.asset?.jpeg == nil ? "RAW · проявка Core Image" : "JPG").foregroundStyle(.secondary)
-                Spacer()
-                Button("Вписать") { model.viewport = ViewportState() }
-                Button("100%") { model.viewport = ViewportState(scale: 1) }
-                Button { model.viewport.zoom(by: 1 / 1.4) } label: { Image(systemName: "minus.magnifyingglass") }
-                Button { model.viewport.zoom(by: 1.4) } label: { Image(systemName: "plus.magnifyingglass") }
-            }.padding(10)
             PreviewPane(model: model)
             Divider()
             ScrollViewReader { proxy in
