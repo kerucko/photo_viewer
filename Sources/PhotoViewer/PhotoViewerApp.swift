@@ -62,7 +62,7 @@ struct NavigationToolbarView: View {
             .overlay(Capsule().strokeBorder(.primary.opacity(0.12), lineWidth: 0.5))
     }
 
-    private func navigationButton(_ symbol: String, title: String, disabled: Bool,
+    private func navigationButton(_ symbol: String, title: String, help: String, disabled: Bool,
                                   action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: symbol)
@@ -71,7 +71,7 @@ struct NavigationToolbarView: View {
         }
         .buttonStyle(.plain)
         .disabled(disabled)
-        .help(title)
+        .help(help)
         .accessibilityLabel(title)
     }
 
@@ -79,13 +79,13 @@ struct NavigationToolbarView: View {
         HStack(spacing: 12) {
             group {
                 HStack(spacing: 8) {
-                    navigationButton("chevron.left", title: "Назад", disabled: model.busy || !model.canBack, action: model.back)
-                    navigationButton("chevron.right", title: "Вперёд", disabled: model.busy || !model.canForward, action: model.forward)
-                    navigationButton("arrow.up", title: "На уровень выше", disabled: model.busy || !model.canUp, action: model.up)
+                    navigationButton("chevron.left", title: "Назад", help: "Назад по истории", disabled: model.busy || !model.canBack, action: model.back)
+                    navigationButton("chevron.right", title: "Вперёд", help: "Вперёд по истории", disabled: model.busy || !model.canForward, action: model.forward)
+                    navigationButton("arrow.up", title: "На уровень выше", help: "Открыть родительскую папку", disabled: model.busy || !model.canUp, action: model.up)
                 }
             }
             group {
-                navigationButton("folder.badge.plus", title: "Открыть папку", disabled: model.busy, action: model.chooseFolder)
+                navigationButton("folder.badge.plus", title: "Открыть папку", help: "Открыть папку… (⌘O)", disabled: model.busy, action: model.chooseFolder)
             }
             group {
                 HStack(spacing: 8) {
@@ -124,10 +124,10 @@ struct BrowserView: View {
     private var compactToolbar: Bool { contentWidth < 1150 }
     private var viewModePicker: some View {
         Picker("Вид", selection: $model.mode) {
-            Label("Значки", systemImage: "square.grid.2x2").tag(ViewMode.icons)
-            Label("Список", systemImage: "list.bullet").tag(ViewMode.list)
-            Label("Колонки", systemImage: "rectangle.split.3x1").tag(ViewMode.columns)
-            Label("Галерея", systemImage: "rectangle.bottomthird.inset.filled").tag(ViewMode.gallery)
+            Label("Значки", systemImage: "square.grid.2x2").tag(ViewMode.icons).help("Значки")
+            Label("Список", systemImage: "list.bullet").tag(ViewMode.list).help("Список")
+            Label("Колонки", systemImage: "rectangle.split.3x1").tag(ViewMode.columns).help("Колонки")
+            Label("Галерея", systemImage: "rectangle.bottomthird.inset.filled").tag(ViewMode.gallery).help("Галерея")
         }
     }
 
@@ -201,7 +201,7 @@ struct BrowserView: View {
                         viewModePicker
                     } label: {
                         Label("Вид", systemImage: viewModeSymbol)
-                    }.disabled(model.busy).help("Режим просмотра")
+                    }.disabled(model.busy).help("Выбрать режим просмотра")
                 } else {
                     viewModePicker.pickerStyle(.segmented).frame(width: 180).disabled(model.busy)
                 }
@@ -210,7 +210,7 @@ struct BrowserView: View {
                 ToolbarItem {
                     if model.selected?.asset?.isPair == true {
                         Button(model.selection.showsRAW ? "RAW → JPG" : "JPG → RAW") { model.toggleRAW() }
-                            .disabled(model.busy).help("Переключить JPEG и проявленный RAW")
+                            .disabled(model.busy).help(model.selection.showsRAW ? "Показать JPEG" : "Показать проявленный RAW")
                     } else if let asset = model.selected?.asset {
                         Text(asset.kind).foregroundStyle(.secondary)
                     }
@@ -233,14 +233,16 @@ struct BrowserView: View {
                     ToolbarItemGroup {
                         Button("Вписать") { model.viewport = ViewportState() }
                             .disabled(model.busy || !model.canZoom)
+                            .help("Вписать в окно (⌘0)")
                         Button("100%") { model.viewport = ViewportState(scale: 1) }
                             .disabled(model.busy || !model.canZoom)
+                            .help("Реальный размер — 100% (⌘1)")
                         Button { model.viewport.zoom(by: 1 / 1.4) } label: {
                             Label("Уменьшить", systemImage: "minus.magnifyingglass")
-                        }.disabled(model.busy || !model.canZoom)
+                        }.disabled(model.busy || !model.canZoom).help("Уменьшить (⌘−)")
                         Button { model.viewport.zoom(by: 1.4) } label: {
                             Label("Увеличить", systemImage: "plus.magnifyingglass")
-                        }.disabled(model.busy || !model.canZoom)
+                        }.disabled(model.busy || !model.canZoom).help("Увеличить (⌘=)")
                     }
                 }
             }
@@ -257,17 +259,18 @@ struct BrowserView: View {
                     Button("Размер") { model.setSort(.size) }
                 } label: { Label("Сортировка", systemImage: "arrow.up.arrow.down") }
                 .disabled(model.busy)
+                .help("Выбрать порядок сортировки")
             }
             ToolbarItem {
                 Button(action: model.confirmTrash) { Label("В Корзину", systemImage: "trash") }
                     .disabled(model.busy || !model.canTrash).help("Переместить все файлы снимка в Корзину (⌘⌫)")
             }
             ToolbarItem {
-                Button(action: model.reload) { Label("Обновить", systemImage: "arrow.clockwise") }.disabled(model.busy).help("Обновить")
+                Button(action: model.reload) { Label("Обновить", systemImage: "arrow.clockwise") }.disabled(model.busy).help("Обновить (⌘R)")
             }
             ToolbarItem {
                 Button { model.showMetadata.toggle() } label: { Label("Сведения", systemImage: "sidebar.right") }
-                    .disabled(model.busy).help("Показать или скрыть сведения (⌘I)")
+                    .disabled(model.busy).help(model.showMetadata ? "Скрыть сведения (⌘I)" : "Показать сведения (⌘I)")
             }
         }
 
