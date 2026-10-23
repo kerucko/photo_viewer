@@ -13,7 +13,15 @@ import Testing
             let url = URL(fileURLWithPath: "/synthetic/photos/исх2/photo\($0).jpg")
             return CatalogEntry(url: url, asset: PhotoAsset(resources: [PhotoResource(url: url)]))
         }
+        model.setSelectedIDs(Set(model.entries.prefix(3).map(\.id)))
         for compact in [false, true] {
+            let toolbar = NavigationToolbarView(model: model, compact: compact)
+            #expect(toolbar.statusText == (compact ? "Выбрано: 3" : "50 фото · выбрано 3"))
+            // Measure the untruncated text at the toolbar's actual font. Its
+            // intrinsic width must fit the status cap used by the real view.
+            let textRenderer = ImageRenderer(content: Text(toolbar.statusText).font(.callout).fixedSize())
+            let textImage = try #require(textRenderer.cgImage)
+            #expect(textImage.width <= (compact ? 90 : 160))
             let renderer = ImageRenderer(content: NavigationToolbarView(model: model, compact: compact)
                 .padding(10).environment(\.colorScheme, .dark))
             renderer.scale = 2
@@ -39,5 +47,11 @@ import Testing
                 try data.write(to: URL(fileURLWithPath: directory).appendingPathComponent("toolbar-\(compact ? "compact" : "regular").png"))
             }
         }
+        model.select(nil)
+        #expect(NavigationToolbarView(model: model, compact: true).statusText == "50 фото")
+        model.loading = true
+        #expect(NavigationToolbarView(model: model, compact: true).statusText == "50 фото")
+        model.busy = true; model.operationTitle = "Перемещение в Корзину…"
+        #expect(NavigationToolbarView(model: model, compact: true).statusText == model.operationTitle)
     }
 }

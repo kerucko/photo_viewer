@@ -32,18 +32,75 @@ struct SelectionScrollRequest: Equatable {
     }
 }
 
+// Mouse gestures share the same deterministic selection rules across the
+// AppKit views. Shift-arrow ranges use that same anchor as mouse gestures.
+@MainActor fileprivate final class CatalogClickSelection {
+    private var beforeClick: SelectionState?
+    private var clickedID: String?
+    func handle(_ id: String?, event: NSEvent, model: BrowserModel) {
+        guard !model.busy else { return }
+        if event.clickCount == 2, let id, let entry = model.entries.first(where: { $0.id == id }) {
+            if clickedID == id, let beforeClick, beforeClick.ids.contains(id) {
+                model.setSelectedIDs(beforeClick.ids, primary: id)
+            }
+            model.activate(entry)
+        } else {
+            beforeClick = model.selection; clickedID = id
+            model.selectGesture(id, command: event.modifierFlags.contains(.command), shift: event.modifierFlags.contains(.shift))
+        }
+    }
+}
+
+@MainActor final class CatalogCollectionView: NSCollectionView {
+    var clickSelection: ((Int?, NSEvent) -> Void)?
+    var extendSelection: ((Int) -> Void)?
+    override func keyDown(with event: NSEvent) {
+        if event.modifierFlags.intersection([.shift, .command, .control, .option]) == .shift,
+           [123, 124, 125, 126].contains(event.keyCode) {
+            extendSelection?([123, 126].contains(event.keyCode) ? -1 : 1)
+        } else { super.keyDown(with: event) }
+    }
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        clickSelection?(indexPathForItem(at: convert(event.locationInWindow, from: nil))?.item, event)
+    }
+}
+
+@MainActor final class CatalogTableView: NSTableView {
+    var clickSelection: ((Int?, NSEvent) -> Void)?
+    var extendSelection: ((Int) -> Void)?
+    override func keyDown(with event: NSEvent) {
+        if event.modifierFlags.intersection([.shift, .command, .control, .option]) == .shift,
+           [123, 124, 125, 126].contains(event.keyCode) {
+            extendSelection?([123, 126].contains(event.keyCode) ? -1 : 1)
+        } else { super.keyDown(with: event) }
+    }
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        let row = row(at: convert(event.locationInWindow, from: nil))
+        clickSelection?(row >= 0 ? row : nil, event)
+    }
+}
+
 struct IconGrid: NSViewRepresentable {
     let model: BrowserModel
     func makeCoordinator() -> Coordinator { Coordinator(model) }
     func makeNSView(context: Context) -> NSScrollView {
-        let collection = NSCollectionView()
+        let collection = CatalogCollectionView()
         collection.collectionViewLayout = NSCollectionViewFlowLayout()
-        collection.isSelectable = true; collection.allowsMultipleSelection = false
+        collection.isSelectable = true; collection.allowsMultipleSelection = true
         collection.register(PhotoItem.self, forItemWithIdentifier: .init("photo"))
         collection.dataSource = context.coordinator; collection.delegate = context.coordinator
         collection.backgroundColors = [.controlBackgroundColor]
-        let doubleClick = NSClickGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.doubleClick(_:)))
-        doubleClick.numberOfClicksRequired = 2; collection.addGestureRecognizer(doubleClick)
+        collection.clickSelection = { [weak coordinator = context.coordinator] index, event in
+            guard let coordinator else { return }
+            coordinator.clicks.handle(index.flatMap { coordinator.entries.indices.contains($0) ? coordinator.entries[$0].id : nil }, event: event, model: coordinator.model)
+            coordinator.syncSelection()
+        }
+        collection.extendSelection = { [weak coordinator = context.coordinator] delta in
+            guard let coordinator else { return }
+            coordinator.model.extendSelection(by: delta); coordinator.syncSelection()
+        }
         let scroll = SelectionScrollView(); scroll.documentView = collection; scroll.hasVerticalScroller = true
         context.coordinator.collection = collection
         return scroll
@@ -58,8 +115,7 @@ struct IconGrid: NSViewRepresentable {
         }
         c.updating = true
         if c.entries != model.entries { c.entries = model.entries; collection.reloadData() }
-        let index = c.entries.firstIndex { $0.id == model.selection.id }
-        collection.selectionIndexPaths = index.map { [IndexPath(item: $0, section: 0)] } ?? []
+        c.syncSelection()
         let request = SelectionScrollRequest(model)
         if c.request != request, let scroll = scroll as? SelectionScrollView {
             c.request = request
@@ -79,6 +135,7 @@ struct IconGrid: NSViewRepresentable {
         var entries: [CatalogEntry] = []
         weak var collection: NSCollectionView?
         var updating = false
+        fileprivate let clicks = CatalogClickSelection()
         var request: SelectionScrollRequest?
         init(_ model: BrowserModel) { self.model = model }
         func collectionView(_ collectionView: NSCollectionView, numberOfItemsInSection section: Int) -> Int { entries.count }
@@ -86,13 +143,17 @@ struct IconGrid: NSViewRepresentable {
             let item = collectionView.makeItem(withIdentifier: .init("photo"), for: indexPath) as! PhotoItem
             item.entry = entries[indexPath.item]; item.render(); return item
         }
-        func collectionView(_ collectionView: NSCollectionView, didSelectItemsAt indexPaths: Set<IndexPath>) {
-            guard !updating else { return }
-            if let index = indexPaths.first?.item, entries.indices.contains(index) { model.select(entries[index].id) }
+        func syncSelection() {
+            let wasUpdating = updating; updating = true
+            collection?.selectionIndexPaths = Set(entries.indices.filter { model.selection.ids.contains(entries[$0].id) }.map { IndexPath(item: $0, section: 0) })
+            updating = wasUpdating
         }
-        @objc func doubleClick(_ gesture: NSClickGestureRecognizer) {
-            guard let collection, let path = collection.indexPathForItem(at: gesture.location(in: collection)) else { return }
-            model.activate(entries[path.item])
+        func collectionView(_ collectionView: NSCollectionView, didSelectItemsAt indexPaths: Set<IndexPath>) { readSelection() }
+        func collectionView(_ collectionView: NSCollectionView, didDeselectItemsAt indexPaths: Set<IndexPath>) { readSelection() }
+        private func readSelection() {
+            guard !updating, let collection else { return }
+            model.setSelectedIDs(Set(collection.selectionIndexPaths.compactMap { entries.indices.contains($0.item) ? entries[$0.item].id : nil }), extending: NSApp.currentEvent?.modifierFlags.contains(.shift) == true)
+            syncSelection()
         }
     }
 }
@@ -123,14 +184,22 @@ struct FileTable: NSViewRepresentable {
     let model: BrowserModel
     func makeCoordinator() -> Coordinator { Coordinator(model) }
     func makeNSView(context: Context) -> NSScrollView {
-        let table = NSTableView(); table.usesAlternatingRowBackgroundColors = true; table.rowHeight = 30
+        let table = CatalogTableView(); table.allowsMultipleSelection = true; table.usesAlternatingRowBackgroundColors = true; table.rowHeight = 30
         for (id, title, width) in [("name", "Имя", 350.0), ("kind", "Тип", 120.0), ("modified", "Дата изменения", 180.0), ("size", "Размер", 110.0)] {
             let column = NSTableColumn(identifier: .init(id)); column.title = title; column.width = width
             column.sortDescriptorPrototype = NSSortDescriptor(key: id, ascending: true)
             table.addTableColumn(column)
         }
         table.delegate = context.coordinator; table.dataSource = context.coordinator
-        table.target = context.coordinator; table.doubleAction = #selector(Coordinator.activate)
+        table.clickSelection = { [weak coordinator = context.coordinator] index, event in
+            guard let coordinator else { return }
+            coordinator.clicks.handle(index.flatMap { coordinator.entries.indices.contains($0) ? coordinator.entries[$0].id : nil }, event: event, model: coordinator.model)
+            coordinator.syncSelection()
+        }
+        table.extendSelection = { [weak coordinator = context.coordinator] delta in
+            guard let coordinator else { return }
+            coordinator.model.extendSelection(by: delta); coordinator.syncSelection()
+        }
         let scroll = SelectionScrollView(); scroll.documentView = table; scroll.hasVerticalScroller = true; scroll.hasHorizontalScroller = true
         context.coordinator.table = table
         return scroll
@@ -140,8 +209,7 @@ struct FileTable: NSViewRepresentable {
         guard let table = c.table else { return }
         c.updating = true
         if c.entries != model.entries { c.entries = model.entries; table.reloadData() }
-        if let index = c.entries.firstIndex(where: { $0.id == model.selection.id }) { table.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false) }
-        else { table.deselectAll(nil) }
+        c.syncSelection()
         table.sortDescriptors = [NSSortDescriptor(key: model.sort.rawValue, ascending: model.ascending)]
         let request = SelectionScrollRequest(model)
         if c.request != request, let scroll = view as? SelectionScrollView {
@@ -157,6 +225,7 @@ struct FileTable: NSViewRepresentable {
     }
     @MainActor final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         var request: SelectionScrollRequest?
+        fileprivate let clicks = CatalogClickSelection()
         var model: BrowserModel; var entries: [CatalogEntry] = []; weak var table: NSTableView?; var updating = false
         init(_ model: BrowserModel) { self.model = model }
         func numberOfRows(in tableView: NSTableView) -> Int { entries.count }
@@ -173,16 +242,21 @@ struct FileTable: NSViewRepresentable {
             field.lineBreakMode = .byTruncatingMiddle
             return field
         }
+        func syncSelection() {
+            let wasUpdating = updating; updating = true
+            table?.selectRowIndexes(IndexSet(entries.indices.filter { model.selection.ids.contains(entries[$0].id) }), byExtendingSelection: false)
+            updating = wasUpdating
+        }
         func tableViewSelectionDidChange(_ notification: Notification) {
-            guard !updating, let table, entries.indices.contains(table.selectedRow) else { return }
-            model.select(entries[table.selectedRow].id)
+            guard !updating, let table else { return }
+            model.setSelectedIDs(Set(table.selectedRowIndexes.compactMap { entries.indices.contains($0) ? entries[$0].id : nil }), extending: NSApp.currentEvent?.modifierFlags.contains(.shift) == true)
+            syncSelection()
         }
         func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
             guard !updating, let descriptor = tableView.sortDescriptors.first, let key = descriptor.key, let sort = CatalogSort(rawValue: key) else { return }
             if model.sort == sort { if model.ascending != descriptor.ascending { model.setSort(sort) } }
             else { model.setSort(sort); if model.ascending != descriptor.ascending { model.setSort(sort) } }
         }
-        @objc func activate() { guard let table, entries.indices.contains(table.clickedRow) else { return }; model.activate(entries[table.clickedRow]) }
     }
 }
 
@@ -191,8 +265,41 @@ private struct ColumnScrollGeometry: Equatable {
     let viewportWidth: CGFloat
 }
 
+private struct ColumnDoubleClickSelection {
+    let ids: Set<String>
+    let target: String
+    let timestamp: TimeInterval
+}
+
 struct ColumnBrowser: View {
     @Bindable var model: BrowserModel
+    @State private var doubleClickSelection: ColumnDoubleClickSelection?
+
+    private func updateSelection(_ ids: Set<String>) {
+        let event = NSApp.currentEvent
+        if let event, [.leftMouseDown, .leftMouseUp].contains(event.type), event.clickCount == 1, ids.count == 1,
+           model.selection.ids.count > 1, let target = ids.first,
+           event.modifierFlags.intersection([.command, .shift]).isEmpty {
+            doubleClickSelection = ColumnDoubleClickSelection(ids: model.selection.ids, target: target, timestamp: event.timestamp)
+        }
+        let shift = event?.modifierFlags.contains(.shift) == true
+        if !shift, event?.modifierFlags.contains(.command) == true {
+            let changed = model.selection.ids.symmetricDifference(ids)
+            if changed.count == 1 {
+                model.selectGesture(changed.first, command: true)
+                return
+            }
+        }
+        model.setSelectedIDs(ids, extending: shift)
+    }
+    private func activate(_ entry: CatalogEntry) {
+        if let saved = doubleClickSelection, saved.target == entry.id,
+           let event = NSApp.currentEvent, event.timestamp - saved.timestamp <= NSEvent.doubleClickInterval {
+            model.setSelectedIDs(saved.ids, primary: entry.id)
+        }
+        doubleClickSelection = nil
+        model.activate(entry)
+    }
     var body: some View {
         HSplitView {
             ScrollViewReader { proxy in
@@ -206,12 +313,13 @@ struct ColumnBrowser: View {
                     VStack(alignment: .leading) {
                         Text(model.folder?.lastPathComponent ?? "Папка").font(.headline).padding(10)
                         ScrollViewReader { selectionProxy in
-                        List(model.entries, selection: Binding(get: { model.selection.id }, set: { model.select($0) })) { entry in
+                        List(model.entries, selection: Binding(get: { model.selection.ids }, set: { updateSelection($0) })) { entry in
                             Label(entry.name, systemImage: entry.isFolder ? "folder" : "photo")
                                 .id(entry.id).tag(entry.id)
-                                .onTapGesture(count: 2) { model.activate(entry) }
+                                .onTapGesture(count: 2) { activate(entry) }
                                 .contextMenu { if entry.isFolder { Button("Открыть") { model.open(entry.url) } } }
                         }
+                        .disabled(model.busy)
                         .onChange(of: SelectionScrollRequest(model), initial: true) { _, request in
                             if let id = request.id, request.entries.contains(id) {
                                 selectionProxy.scrollTo(id)
@@ -247,7 +355,9 @@ struct FolderColumn: View {
             List(folders, id: \.path) { folder in
                 Button { model.open(folder) } label: {
                     HStack { Label(folder.lastPathComponent, systemImage: "folder"); Spacer(); Image(systemName: "chevron.right") }
-                }.buttonStyle(.plain).listRowBackground(selected.contains(folder) ? Color.accentColor.opacity(0.15) : .clear)
+                }.buttonStyle(.plain)
+                    .help("Открыть папку «\(folder.lastPathComponent)»")
+                    .listRowBackground(selected.contains(folder) ? Color.accentColor.opacity(0.15) : .clear)
             }
         }.frame(width: 190)
         .task(id: parent) {

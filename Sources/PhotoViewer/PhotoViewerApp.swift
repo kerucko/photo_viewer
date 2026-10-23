@@ -36,7 +36,7 @@ import PhotoCore
                 Button("Библиотека") { model.openLibrary() }.disabled(model.busy)
                 Button("Импортировать с SD…") { model.chooseImport() }.disabled(model.busy)
                 Divider()
-                Button("Переместить снимок в Корзину…") { model.confirmTrash() }
+                Button("Переместить выбранные снимки в Корзину…") { model.confirmTrash() }
                     .keyboardShortcut(.delete, modifiers: .command).disabled(!model.canTrash)
                 Button("Обновить") { model.reload() }.keyboardShortcut("r").disabled(model.busy)
             }
@@ -48,6 +48,17 @@ import PhotoCore
 struct NavigationToolbarView: View {
     @Bindable var model: BrowserModel
     var compact: Bool
+
+    var statusText: String {
+        if model.busy { return model.operationTitle }
+        let selected = model.selectedAssets.count
+        if selected == 0 { return "\(model.photos.count) фото" }
+        return compact ? "Выбрано: \(selected)" : "\(model.photos.count) фото · выбрано \(selected)"
+    }
+    private var statusHelp: String {
+        if model.busy { return model.operationTitle }
+        return "\(model.photos.count) фото · выбрано \(model.selectedAssets.count)"
+    }
 
     private var folderName: String {
         guard let folder = model.folder else { return "Фото" }
@@ -104,16 +115,33 @@ struct NavigationToolbarView: View {
                         ProgressView().controlSize(.small)
                             .help(model.busy ? model.operationTitle : "Загрузка папки…")
                     }
-                    Text(model.busy ? model.operationTitle : "\(model.photos.count) фото")
+                    Text(statusText)
                         .foregroundStyle(.secondary).lineLimit(1)
                         .frame(maxWidth: compact ? 90 : 160, alignment: .leading)
                         .fixedSize(horizontal: true, vertical: false)
-                        .help(model.busy ? model.operationTitle : "\(model.photos.count) фото")
+                        .help(statusHelp)
                 }
             }
         }
         .font(.callout)
         .fixedSize(horizontal: true, vertical: false)
+    }
+}
+
+@MainActor enum BrowserKeyboard {
+    static func handle(_ event: NSEvent, model: BrowserModel, firstResponder: NSResponder?) -> Bool {
+        guard !model.busy, !(firstResponder is NSTextView) else { return false }
+        let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
+        if event.keyCode == 0, modifiers == .command, model.canSelectAll {
+            model.selectAllPhotos(); return true
+        }
+        guard modifiers.isEmpty else { return false }
+        switch event.keyCode {
+        case 123: model.step(-1); return true
+        case 124: model.step(1); return true
+        case 49: model.toggleGallery(); return true
+        default: return false
+        }
     }
 }
 
@@ -156,13 +184,14 @@ struct BrowserView: View {
                         .foregroundStyle(.secondary).lineLimit(2)
                     Spacer()
                     Button("Подробнее…") { model.showCatalogIssues() }
+                        .help("Показать сведения о недоступных файлах библиотеки")
                 }.font(.callout).padding(10)
                 Divider()
             }
             if let error = model.error {
-                ContentUnavailableView { Label("Папка недоступна", systemImage: "externaldrive.badge.exclamationmark") } description: { Text(error) } actions: { Button("Повторить") { model.reload() } }
+                ContentUnavailableView { Label("Папка недоступна", systemImage: "externaldrive.badge.exclamationmark") } description: { Text(error) } actions: { Button("Повторить") { model.reload() }.help("Повторить загрузку папки (⌘R)") }
             } else if model.folder == nil {
-                ContentUnavailableView { Label("Ваши фотографии", systemImage: "photo.on.rectangle.angled") } description: { Text("Откройте папку или перетащите её сюда.\nJPG и RAF одного снимка будут показаны вместе.") } actions: { Button("Открыть папку…") { model.chooseFolder() }.buttonStyle(.borderedProminent) }
+                ContentUnavailableView { Label("Ваши фотографии", systemImage: "photo.on.rectangle.angled") } description: { Text("Откройте папку или перетащите её сюда.\nJPG и RAF одного снимка будут показаны вместе.") } actions: { Button("Открыть папку…") { model.chooseFolder() }.buttonStyle(.borderedProminent).help("Открыть папку с фотографиями (⌘O)") }
             } else {
                 switch model.mode {
                 case .icons: IconGrid(model: model)
@@ -181,7 +210,7 @@ struct BrowserView: View {
                     Spacer()
                     if model.selected?.asset?.isPair == true {
                         Button(model.selection.showsRAW ? "RAW → JPG" : "JPG → RAW") { model.toggleRAW() }
-                            .help("Переключить JPEG и проявленный RAW")
+                            .help(model.selection.showsRAW ? "Показать JPEG" : "Показать проявленный RAW")
                     } else if let asset = model.selected?.asset { Text(asset.kind).foregroundStyle(.secondary) }
                 }.font(.callout).padding(10)
             }
@@ -263,7 +292,7 @@ struct BrowserView: View {
             }
             ToolbarItem {
                 Button(action: model.confirmTrash) { Label("В Корзину", systemImage: "trash") }
-                    .disabled(model.busy || !model.canTrash).help("Переместить все файлы снимка в Корзину (⌘⌫)")
+                    .disabled(model.busy || !model.canTrash).help("Переместить все файлы выбранных снимков в Корзину (⌘⌫)")
             }
             ToolbarItem {
                 Button(action: model.reload) { Label("Обновить", systemImage: "arrow.clockwise") }.disabled(model.busy).help("Обновить (⌘R)")
@@ -284,13 +313,8 @@ struct BrowserView: View {
         }
         .onAppear {
             keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-                guard !model.busy, NSApp.keyWindow != nil, NSApp.modalWindow == nil, !(NSApp.keyWindow?.firstResponder is NSTextView), event.modifierFlags.intersection([.command, .control, .option]).isEmpty else { return event }
-                switch event.keyCode {
-                case 123: model.step(-1); return nil
-                case 124: model.step(1); return nil
-                case 49: model.toggleGallery(); return nil
-                default: return event
-                }
+                guard let window = NSApp.keyWindow, NSApp.modalWindow == nil else { return event }
+                return BrowserKeyboard.handle(event, model: model, firstResponder: window.firstResponder) ? nil : event
             }
         }
         .onDisappear { if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }; keyMonitor = nil }

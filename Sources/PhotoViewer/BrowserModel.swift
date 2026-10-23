@@ -14,7 +14,9 @@ import PhotoCore
     private var library: PhotoLibrary?
     var busy = false
     var operationTitle = ""
-    var canTrash: Bool { selected?.asset != nil && !busy && !loading }
+    var selectedAssets: [PhotoAsset] { entries.filter { selection.ids.contains($0.id) }.compactMap(\.asset) }
+    var canTrash: Bool { !selectedAssets.isEmpty && !busy && !loading }
+    var canSelectAll: Bool { mode != .gallery && !photos.isEmpty && !busy }
     var canUp: Bool { !busy && !isLibrary && folder != nil && folder?.path != "/" }
     var entries: [CatalogEntry] = []
     var selection = SelectionState()
@@ -39,6 +41,7 @@ import PhotoCore
     private var history: [Location] = []
     private var historyIndex = -1
     private var folderRevision = 0
+    private var selectFirstOnRefresh = false
     private var previewTask: Task<Void, Never>?
     private var prefetchTask: Task<Void, Never>?
     private var priorMode: ViewMode = .icons
@@ -82,7 +85,7 @@ import PhotoCore
         if case .library(let root) = destination {
             if library?.root != root { library = PhotoLibrary(root: root) }
         }
-        if changed { entries = []; catalogIssues = []; select(nil) }
+        if changed { entries = []; catalogIssues = []; select(nil); selectFirstOnRefresh = true }
         reload()
     }
     func back() { guard !busy, canBack else { return }; historyIndex -= 1; navigate(history[historyIndex], recordHistory: false) }
@@ -111,10 +114,9 @@ import PhotoCore
             catalogIssues = issues
             entries = FolderCatalog.sorted(contents, by: sort, ascending: ascending)
             loading = false
-            if !entries.contains(where: { $0.id == selection.id }) {
-                let survivor = photos.isEmpty ? nil : photos[min(index ?? 0, photos.count - 1)].id
-                select(survivor)
-            } else { loadPreview() }
+            reconcileSelection(nearest: index, selectFirstIfEmpty: selectFirstOnRefresh)
+            selectFirstOnRefresh = false
+            loadPreview()
         } catch {
             guard revision == folderRevision else { return }
             entries = []; catalogIssues = []; select(nil); loading = false
@@ -156,7 +158,8 @@ import PhotoCore
                 let alert = NSAlert()
                 alert.messageText = "Импорт завершён"
                 alert.informativeText = "Добавлено файлов: \(report.imported). Пропущено: \(report.skipped)." + (report.issues.isEmpty ? "" : "\n\n" + Self.summarizeIssues(report.issues))
-                alert.addButton(withTitle: "Открыть библиотеку"); alert.addButton(withTitle: "Закрыть")
+                alert.addButton(withTitle: "Открыть библиотеку").toolTip = "Открыть библиотеку с импортированными фотографиями"
+                alert.addButton(withTitle: "Закрыть").toolTip = "Закрыть отчёт об импорте"
                 if alert.runModal() == .alertFirstButtonReturn { navigate(.library(root)) }
             } catch {
                 busy = false; loadPreview()
@@ -166,32 +169,49 @@ import PhotoCore
         }
     }
     func confirmTrash() {
-        guard canTrash, let asset = selected?.asset, location != nil else { return }
-        let alert = NSAlert(); alert.alertStyle = .warning
-        alert.messageText = "Переместить снимок в Корзину?"
-        alert.informativeText = "Будут перемещены все файлы снимка:\n" + asset.resources.map { $0.url.lastPathComponent }.joined(separator: "\n")
-        alert.addButton(withTitle: "В Корзину"); alert.addButton(withTitle: "Отмена")
+        guard canTrash, location != nil else { return }
+        // Capture the complete group before confirmation or asynchronous work.
+        let assets = selectedAssets
+        let alert = Self.trashConfirmation(for: assets)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let index = photos.firstIndex { $0.id == asset.id } ?? 0
+        let index = photos.firstIndex { $0.id == selection.id } ?? 0
         let managedRoot: URL?
         if case .library(let root)? = location { managedRoot = root } else { managedRoot = libraryRoot }
         let target = managedRoot.map { root in library?.root == root ? library! : PhotoLibrary(root: root) }
         beginOperation("Перемещение в Корзину…")
         Task {
-            do {
-                let report: TrashReport
-                if let target, asset.resources.allSatisfy({ $0.url.standardizedFileURL.path.hasPrefix(target.root.standardizedFileURL.path + "/") }) { report = try await target.trash(asset) }
-                else { report = await Task.detached { PhotoTrash.trash(asset) }.value }
-                busy = false
-                await refresh(nearest: index)
-                if !report.failures.isEmpty {
-                    showMessage("Не все файлы перемещены в Корзину", "Перемещено: \(report.trashed.count).\n" + report.failures.joined(separator: "\n"))
+            let report = await PhotoTrash.trash(assets) { asset in
+                if let target, asset.resources.allSatisfy({ $0.url.standardizedFileURL.path.hasPrefix(target.root.standardizedFileURL.path + "/") }) {
+                    return try await target.trash(asset)
                 }
-            } catch {
-                busy = false; await refresh(nearest: index)
-                showMessage("Не удалось переместить в Корзину", error.localizedDescription)
+                return await Task.detached { PhotoTrash.trash(asset) }.value
+            }
+            busy = false
+            await refresh(nearest: index)
+            if !report.failures.isEmpty {
+                showMessage("Не все файлы перемещены в Корзину", "Перемещено: \(report.trashed.count).\n" + Self.summarizeIssues(report.failures))
             }
         }
+    }
+    static func trashConfirmation(for assets: [PhotoAsset]) -> NSAlert {
+        let resources = assets.flatMap(\.resources)
+        let alert = NSAlert(); alert.alertStyle = .warning
+        alert.messageText = assets.count == 1 ? "Переместить снимок в Корзину?" : "Переместить выбранные снимки в Корзину?"
+        alert.informativeText = "Снимков: \(assets.count). Файлов: \(resources.count). Будут перемещены все перечисленные ресурсы, включая оба файла пар."
+        let list = NSTextView(frame: NSRect(x: 0, y: 0, width: 440, height: 160))
+        list.string = resources.map { $0.url.lastPathComponent }.joined(separator: "\n")
+        list.isEditable = false; list.isSelectable = true; list.font = .systemFont(ofSize: 12)
+        list.isHorizontallyResizable = false; list.isVerticallyResizable = true
+        list.minSize = NSSize(width: 440, height: 160)
+        list.maxSize = NSSize(width: 440, height: CGFloat.greatestFiniteMagnitude)
+        list.textContainer?.widthTracksTextView = true
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 440, height: 160))
+        scroll.documentView = list; scroll.hasVerticalScroller = true
+        list.sizeToFit()
+        alert.accessoryView = scroll
+        alert.addButton(withTitle: "В Корзину").toolTip = "Переместить все перечисленные файлы выбранных снимков в системную Корзину"
+        alert.addButton(withTitle: "Отмена").toolTip = "Закрыть подтверждение без перемещения файлов"
+        return alert
     }
     private func beginOperation(_ title: String) {
         busy = true; operationTitle = title
@@ -207,22 +227,79 @@ import PhotoCore
     }
     private func showMessage(_ title: String, _ detail: String) {
         let alert = NSAlert(); alert.messageText = title; alert.informativeText = detail
-        alert.addButton(withTitle: "OK"); alert.runModal()
+        alert.addButton(withTitle: "OK").toolTip = "Закрыть сообщение"
+        alert.runModal()
     }
     func setSort(_ field: CatalogSort) {
+        guard !busy else { return }
         if sort == field { ascending.toggle() } else { sort = field; ascending = true }
         UserDefaults.standard.set(sort.rawValue, forKey: "sort"); UserDefaults.standard.set(ascending, forKey: "ascending")
         entries = FolderCatalog.sorted(entries, by: sort, ascending: ascending)
     }
+    private func changeSelection(_ change: (inout SelectionState) -> Void) {
+        guard !busy else { return }
+        let prior = selection.id
+        change(&selection)
+        if prior != selection.id { viewport = ViewportState(); loadPreview() }
+    }
     func select(_ id: String?) {
         guard !busy else { return }
-        guard selection.id != id else { return }
-        selection.select(id); viewport = ViewportState(); loadPreview()
+        selectFirstOnRefresh = false
+        changeSelection { $0.select(id) }
+    }
+    func selectGesture(_ id: String?, command: Bool = false, shift: Bool = false) {
+        guard let id, let entry = entries.first(where: { $0.id == id }) else { select(nil); return }
+        let order = photos.map(\.id)
+        changeSelection { selection in
+            if entry.isFolder { selection.select(id) }
+            else if shift { selection.extend(to: id, orderedIDs: order) }
+            else if command {
+                selection.retain(orderedIDs: order)
+                selection.toggle(id, orderedIDs: order)
+            } else { selection.select(id) }
+        }
+    }
+    func setSelectedIDs(_ ids: Set<String>, primary: String? = nil, extending: Bool = false) {
+        let valid = entries.filter { ids.contains($0.id) }
+        let addedFolder = extending ? nil : valid.first { $0.isFolder && !selection.ids.contains($0.id) }
+        let allowed = addedFolder.map { [$0] } ?? (valid.count > 1 ? valid.filter { !$0.isFolder } : valid)
+        let order = entries.map(\.id)
+        let added = allowed.last { !selection.ids.contains($0.id) }?.id
+        if extending, let anchor = selection.anchorID ?? selection.id,
+           let anchorIndex = order.firstIndex(of: anchor), !valid.isEmpty {
+            let endpoint = valid.max {
+                abs((order.firstIndex(of: $0.id) ?? 0) - anchorIndex) < abs((order.firstIndex(of: $1.id) ?? 0) - anchorIndex)
+            }!.id
+            selectGesture(endpoint, shift: true)
+        } else {
+            changeSelection { $0.replace(Set(allowed.map(\.id)), primary: primary ?? added, orderedIDs: order) }
+        }
+    }
+    func selectAllPhotos() {
+        guard canSelectAll else { return }
+        let ids = photos.map(\.id)
+        changeSelection { $0.replace(Set(ids), primary: $0.id, orderedIDs: ids) }
+    }
+    func reconcileSelection(nearest index: Int? = nil, selectFirstIfEmpty: Bool = false) {
+        let hadSelection = !selection.ids.isEmpty
+        let prior = selection.id
+        selection.retain(orderedIDs: entries.map(\.id))
+        if (hadSelection || selectFirstIfEmpty), selection.ids.isEmpty, !photos.isEmpty {
+            selection.select(photos[min(index ?? 0, photos.count - 1)].id)
+        }
+        if prior != selection.id { viewport = ViewportState() }
     }
     func activate(_ entry: CatalogEntry) {
-        if entry.isFolder { open(entry.url) } else { select(entry.id); if mode != .gallery { priorMode = mode }; mode = .gallery }
+        guard !busy else { return }
+        if entry.isFolder { open(entry.url) }
+        else {
+            changeSelection { $0.focus(entry.id) }
+            if mode != .gallery { priorMode = mode }
+            mode = .gallery
+        }
     }
     func toggleGallery() {
+        guard !busy else { return }
         if mode == .gallery { mode = priorMode }
         else if selected?.asset != nil { priorMode = mode; mode = .gallery }
     }
@@ -230,6 +307,11 @@ import PhotoCore
         guard !photos.isEmpty else { return }
         let current = photos.firstIndex { $0.id == selection.id } ?? (delta > 0 ? -1 : photos.count)
         select(photos[min(max(current + delta, 0), photos.count - 1)].id)
+    }
+    func extendSelection(by delta: Int) {
+        guard !busy, !photos.isEmpty else { return }
+        let current = photos.firstIndex { $0.id == selection.id } ?? (delta > 0 ? -1 : photos.count)
+        selectGesture(photos[min(max(current + delta, 0), photos.count - 1)].id, shift: true)
     }
     func toggleRAW() {
         guard !busy else { return }

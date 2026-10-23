@@ -13,7 +13,7 @@ import PhotoCore
         return model
     }
 
-    private func photoFixture() async throws -> (model: BrowserModel, directory: URL) {
+    func photoFixture() async throws -> (model: BrowserModel, directory: URL) {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let context = try #require(CGContext(data: nil, width: 48, height: 32, bitsPerComponent: 8,

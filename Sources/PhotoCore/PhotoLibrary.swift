@@ -19,6 +19,18 @@ public struct TrashReport: Sendable {
 }
 
 public enum PhotoTrash {
+    /// Continue through the captured asset group, retaining both successful
+    /// resources and per-asset failures. The operation may use library journaling.
+    public static func trash(_ assets: [PhotoAsset], using operation: @Sendable (PhotoAsset) async throws -> TrashReport) async -> TrashReport {
+        var result = TrashReport()
+        for asset in assets {
+            do {
+                let report = try await operation(asset)
+                result.trashed += report.trashed; result.failures += report.failures
+            } catch { result.failures.append("\(asset.name): \(error.localizedDescription)") }
+        }
+        return result
+    }
     public static func trash(_ asset: PhotoAsset) -> TrashReport {
         trash(asset, move: { url in try FileManager.default.trashItem(at: url, resultingItemURL: nil) })
     }

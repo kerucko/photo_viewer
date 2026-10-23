@@ -90,13 +90,50 @@ public struct FolderCatalog: CatalogSource {
 /// Selection belongs to an asset, not a particular resource or view mode.
 public struct SelectionState: Sendable {
     public private(set) var id: String?
+    public private(set) var ids: Set<String> = []
+    public private(set) var anchorID: String?
     public private(set) var showsRAW = false
     public private(set) var revision: UInt64 = 0
     public var mode: ViewMode = .icons
     public init() {}
-    public mutating func select(_ id: String?) {
-        guard id != self.id else { return }
+
+    private mutating func setPrimary(_ id: String?) {
+        guard self.id != id else { return }
         self.id = id; showsRAW = false; revision &+= 1
+    }
+    public mutating func select(_ id: String?) {
+        ids = id.map { [$0] } ?? []; anchorID = id; setPrimary(id)
+    }
+    public mutating func replace(_ ids: Set<String>, primary: String?, orderedIDs: [String]) {
+        self.ids = ids.intersection(orderedIDs)
+        let primary = primary.flatMap { self.ids.contains($0) ? $0 : nil }
+            ?? id.flatMap { self.ids.contains($0) ? $0 : nil }
+            ?? orderedIDs.first { self.ids.contains($0) }
+        setPrimary(primary); anchorID = primary
+    }
+    public mutating func focus(_ id: String) {
+        guard ids.contains(id) else { select(id); return }
+        setPrimary(id)
+    }
+    public mutating func toggle(_ id: String, orderedIDs: [String]) {
+        if ids.remove(id) != nil {
+            if self.id == id { setPrimary(orderedIDs.first { ids.contains($0) }) }
+        }
+        else { ids.insert(id); setPrimary(id) }
+        anchorID = id
+    }
+    public mutating func extend(to id: String, orderedIDs: [String]) {
+        guard let end = orderedIDs.firstIndex(of: id) else { return }
+        let anchor = anchorID.flatMap { orderedIDs.firstIndex(of: $0) }
+            ?? self.id.flatMap { orderedIDs.firstIndex(of: $0) } ?? end
+        anchorID = orderedIDs[anchor]
+        ids = Set(orderedIDs[min(anchor, end)...max(anchor, end)])
+        setPrimary(id)
+    }
+    public mutating func retain(orderedIDs: [String]) {
+        ids.formIntersection(orderedIDs)
+        if let id, !ids.contains(id) { setPrimary(orderedIDs.first { ids.contains($0) }) }
+        if let anchorID, !orderedIDs.contains(anchorID) { self.anchorID = id }
     }
     public mutating func toggleRAW() { showsRAW.toggle(); revision &+= 1 }
     public func accepts(_ request: UInt64) -> Bool { revision == request }
