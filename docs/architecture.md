@@ -37,6 +37,10 @@ sRGB-рендер RAW; JPEG сохраняет цветовое простран
 
 Swift Package Manager без внешних зависимостей. Минимальная система macOS 26.
 Скрипт формирует bundle и локальную ad-hoc подпись. Кеши сборки лежат в `.build`.
+Исходник значка хранится в `Resources/AppIcon.png`. `scripts/build-app.sh` через
+`sips` создаёт в `.build/AppIcon.iconset` десять вариантов 16–1024 пикселей,
+через `iconutil` упаковывает их в `Contents/Resources/AppIcon.icns` и задаёт
+`CFBundleIconFile` в `Info.plist` до подписи bundle.
 Настройка глобального окружения, установка Xcode и notarization не требуются.
 
 ## Метаданные и настройки просмотра
