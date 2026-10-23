@@ -336,9 +336,10 @@ struct GalleryView: View {
                         }
                     }.padding(10)
                 }.frame(height: model.filmstripSize.stripHeight)
-                    .onChange(of: model.selection.id) { _, id in if let id { proxy.scrollTo(id, anchor: .center) } }
-                    .onChange(of: model.filmstripSize) { _, _ in if let id = model.selection.id { proxy.scrollTo(id, anchor: .center) } }
-            }
+                    .onChange(of: SelectionScrollRequest(model), initial: true) { _, request in
+                        if let id = request.id, request.entries.contains(id) { proxy.scrollTo(id, anchor: .center) }
+                    }
+            }.id(model.filmstripSize)
         }
     }
 }

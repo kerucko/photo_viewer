@@ -2,6 +2,36 @@ import AppKit
 import SwiftUI
 import PhotoCore
 
+// A request changes only when navigation, selection or item order changes.
+// Thumbnail/preview updates therefore never undo manual scrolling.
+struct SelectionScrollRequest: Equatable {
+    let location: BrowserModel.Location?
+    let mode: ViewMode
+    let id: String?
+    let entries: [String]
+
+    @MainActor init(_ model: BrowserModel) {
+        location = model.location; mode = model.mode
+        id = model.selection.id; entries = model.entries.map(\.id)
+    }
+}
+
+@MainActor final class SelectionScrollView: NSScrollView {
+    var revealSelection: (() -> Void)?
+    override func layout() {
+        super.layout()
+        guard window != nil, contentSize.width > 0, contentSize.height > 0,
+              let revealSelection else { return }
+        self.revealSelection = nil
+        documentView?.layoutSubtreeIfNeeded()
+        revealSelection()
+    }
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window != nil { needsLayout = true }
+    }
+}
+
 struct IconGrid: NSViewRepresentable {
     let model: BrowserModel
     func makeCoordinator() -> Coordinator { Coordinator(model) }
@@ -14,7 +44,7 @@ struct IconGrid: NSViewRepresentable {
         collection.backgroundColors = [.controlBackgroundColor]
         let doubleClick = NSClickGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.doubleClick(_:)))
         doubleClick.numberOfClicksRequired = 2; collection.addGestureRecognizer(doubleClick)
-        let scroll = NSScrollView(); scroll.documentView = collection; scroll.hasVerticalScroller = true
+        let scroll = SelectionScrollView(); scroll.documentView = collection; scroll.hasVerticalScroller = true
         context.coordinator.collection = collection
         return scroll
     }
@@ -30,17 +60,26 @@ struct IconGrid: NSViewRepresentable {
         if c.entries != model.entries { c.entries = model.entries; collection.reloadData() }
         let index = c.entries.firstIndex { $0.id == model.selection.id }
         collection.selectionIndexPaths = index.map { [IndexPath(item: $0, section: 0)] } ?? []
-        if let index, c.selectedID != model.selection.id {
-            collection.scrollToItems(at: [IndexPath(item: index, section: 0)], scrollPosition: .nearestVerticalEdge)
+        let request = SelectionScrollRequest(model)
+        if c.request != request, let scroll = scroll as? SelectionScrollView {
+            c.request = request
+            scroll.revealSelection = { [weak c, weak collection] in
+                guard let c, let collection, SelectionScrollRequest(c.model) == request,
+                      let index = c.entries.firstIndex(where: { $0.id == request.id }) else { return }
+                if let frame = collection.collectionViewLayout?.layoutAttributesForItem(at: IndexPath(item: index, section: 0))?.frame {
+                    collection.scrollToVisible(frame)
+                }
+            }
+            scroll.needsLayout = true
         }
-        c.selectedID = model.selection.id; c.updating = false
+        c.updating = false
     }
     @MainActor final class Coordinator: NSObject, NSCollectionViewDataSource, NSCollectionViewDelegate {
         var model: BrowserModel
         var entries: [CatalogEntry] = []
         weak var collection: NSCollectionView?
         var updating = false
-        var selectedID: String?
+        var request: SelectionScrollRequest?
         init(_ model: BrowserModel) { self.model = model }
         func collectionView(_ collectionView: NSCollectionView, numberOfItemsInSection section: Int) -> Int { entries.count }
         func collectionView(_ collectionView: NSCollectionView, itemForRepresentedObjectAt indexPath: IndexPath) -> NSCollectionViewItem {
@@ -92,7 +131,7 @@ struct FileTable: NSViewRepresentable {
         }
         table.delegate = context.coordinator; table.dataSource = context.coordinator
         table.target = context.coordinator; table.doubleAction = #selector(Coordinator.activate)
-        let scroll = NSScrollView(); scroll.documentView = table; scroll.hasVerticalScroller = true; scroll.hasHorizontalScroller = true
+        let scroll = SelectionScrollView(); scroll.documentView = table; scroll.hasVerticalScroller = true; scroll.hasHorizontalScroller = true
         context.coordinator.table = table
         return scroll
     }
@@ -104,9 +143,20 @@ struct FileTable: NSViewRepresentable {
         if let index = c.entries.firstIndex(where: { $0.id == model.selection.id }) { table.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false) }
         else { table.deselectAll(nil) }
         table.sortDescriptors = [NSSortDescriptor(key: model.sort.rawValue, ascending: model.ascending)]
+        let request = SelectionScrollRequest(model)
+        if c.request != request, let scroll = view as? SelectionScrollView {
+            c.request = request
+            scroll.revealSelection = { [weak c, weak table] in
+                guard let c, let table, SelectionScrollRequest(c.model) == request,
+                      let index = c.entries.firstIndex(where: { $0.id == request.id }) else { return }
+                table.scrollRowToVisible(index)
+            }
+            scroll.needsLayout = true
+        }
         c.updating = false
     }
     @MainActor final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
+        var request: SelectionScrollRequest?
         var model: BrowserModel; var entries: [CatalogEntry] = []; weak var table: NSTableView?; var updating = false
         init(_ model: BrowserModel) { self.model = model }
         func numberOfRows(in tableView: NSTableView) -> Int { entries.count }
@@ -136,6 +186,11 @@ struct FileTable: NSViewRepresentable {
     }
 }
 
+private struct ColumnScrollGeometry: Equatable {
+    let contentWidth: CGFloat
+    let viewportWidth: CGFloat
+}
+
 struct ColumnBrowser: View {
     @Bindable var model: BrowserModel
     var body: some View {
@@ -150,18 +205,32 @@ struct ColumnBrowser: View {
                     }
                     VStack(alignment: .leading) {
                         Text(model.folder?.lastPathComponent ?? "Папка").font(.headline).padding(10)
+                        ScrollViewReader { selectionProxy in
                         List(model.entries, selection: Binding(get: { model.selection.id }, set: { model.select($0) })) { entry in
                             Label(entry.name, systemImage: entry.isFolder ? "folder" : "photo")
-                                .tag(entry.id)
+                                .id(entry.id).tag(entry.id)
                                 .onTapGesture(count: 2) { model.activate(entry) }
                                 .contextMenu { if entry.isFolder { Button("Открыть") { model.open(entry.url) } } }
+                        }
+                        .onChange(of: SelectionScrollRequest(model), initial: true) { _, request in
+                            if let id = request.id, request.entries.contains(id) {
+                                selectionProxy.scrollTo(id)
+                            }
+                        }
                         }
                     }.frame(width: 250).id("current-folder")
                 }
             }
-            .onAppear { proxy.scrollTo("current-folder", anchor: .trailing) }
-            .onChange(of: model.folder) { _, _ in proxy.scrollTo("current-folder", anchor: .trailing) }
-            }.frame(minWidth: 260)
+            // Wait for actual content and viewport geometry. Scroll offset is
+            // deliberately excluded, so manual horizontal scrolling stays put.
+            .onScrollGeometryChange(for: ColumnScrollGeometry.self) { geometry in
+                ColumnScrollGeometry(contentWidth: geometry.contentSize.width, viewportWidth: geometry.containerSize.width)
+            } action: { _, geometry in
+                if geometry.contentWidth > 0, geometry.viewportWidth > 0 {
+                    proxy.scrollTo("current-folder", anchor: .trailing)
+                }
+            }
+            }.id(model.folder).frame(minWidth: 260)
             PreviewPane(model: model).frame(minWidth: 280)
         }
     }
