@@ -35,6 +35,7 @@ import PhotoCore
                 Button("Открыть библиотеку…") { model.chooseLibrary() }.disabled(model.busy)
                 Button("Библиотека") { model.openLibrary() }.disabled(model.busy)
                 Button("Импортировать с SD…") { model.chooseImport() }.disabled(model.busy)
+                Button("Создать ZIP-архив…") { model.createZIP() }.disabled(!model.canExportZIP)
                 Divider()
                 Button("Переместить выбранные снимки в Корзину…") { model.confirmTrash() }
                     .keyboardShortcut(.delete, modifiers: .command).disabled(!model.canTrash)
@@ -130,8 +131,18 @@ struct NavigationToolbarView: View {
 
 @MainActor enum BrowserKeyboard {
     static func handle(_ event: NSEvent, model: BrowserModel, firstResponder: NSResponder?) -> Bool {
-        guard !model.busy, !(firstResponder is NSTextView) else { return false }
+        guard !model.busy, NSApp.modalWindow == nil, !(firstResponder is NSTextView), !(firstResponder is NSTextField) else { return false }
         let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
+        if model.mode == .columns {
+            guard let table = firstResponder as? ColumnTableView, table.browserModel === model else { return false }
+            model.focusColumn(table.columnID)
+            if event.keyCode == 0, modifiers == .command {
+                model.selectAllColumnPhotos(table.columnID); return true
+            }
+            if [123, 124, 125, 126].contains(event.keyCode), modifiers.isEmpty || modifiers == .shift {
+                return model.columnKey(event.keyCode, shift: modifiers == .shift)
+            }
+        }
         if event.keyCode == 0, modifiers == .command, model.canSelectAll {
             model.selectAllPhotos(); return true
         }
@@ -188,7 +199,7 @@ struct BrowserView: View {
                 }.font(.callout).padding(10)
                 Divider()
             }
-            if let error = model.error {
+            if let error = model.error, model.mode != .columns {
                 ContentUnavailableView { Label("Папка недоступна", systemImage: "externaldrive.badge.exclamationmark") } description: { Text(error) } actions: { Button("Повторить") { model.reload() }.help("Повторить загрузку папки (⌘R)") }
             } else if model.folder == nil {
                 ContentUnavailableView { Label("Ваши фотографии", systemImage: "photo.on.rectangle.angled") } description: { Text("Откройте папку или перетащите её сюда.\nJPG и RAF одного снимка будут показаны вместе.") } actions: { Button("Открыть папку…") { model.chooseFolder() }.buttonStyle(.borderedProminent).help("Открыть папку с фотографиями (⌘O)") }
@@ -221,9 +232,17 @@ struct BrowserView: View {
                 .inspectorColumnWidth(min: 240, ideal: 280, max: 380)
         }
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { contentWidth = $0 }
+        .sheet(item: $model.zipSession) { ZIPExportView(session: $0) }
         .navigationTitle("")
         .toolbar {
             navigationToolbar
+            if model.mode != .gallery {
+                ToolbarItem {
+                    Button("Создать ZIP-архив…", systemImage: "archivebox") { model.createZIP() }
+                        .disabled(!model.canExportZIP).help("Создать ZIP-архив выбранных снимков или всей папки")
+                }
+                ToolbarSpacer(.fixed)
+            }
             ToolbarItem(placement: .principal) {
                 if compactToolbar {
                     Menu {

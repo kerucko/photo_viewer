@@ -265,108 +265,181 @@ private struct ColumnScrollGeometry: Equatable {
     let viewportWidth: CGFloat
 }
 
-private struct ColumnDoubleClickSelection {
-    let ids: Set<String>
-    let target: String
-    let timestamp: TimeInterval
-}
-
 struct ColumnBrowser: View {
     @Bindable var model: BrowserModel
-    @State private var doubleClickSelection: ColumnDoubleClickSelection?
-
-    private func updateSelection(_ ids: Set<String>) {
-        let event = NSApp.currentEvent
-        if let event, [.leftMouseDown, .leftMouseUp].contains(event.type), event.clickCount == 1, ids.count == 1,
-           model.selection.ids.count > 1, let target = ids.first,
-           event.modifierFlags.intersection([.command, .shift]).isEmpty {
-            doubleClickSelection = ColumnDoubleClickSelection(ids: model.selection.ids, target: target, timestamp: event.timestamp)
-        }
-        let shift = event?.modifierFlags.contains(.shift) == true
-        if !shift, event?.modifierFlags.contains(.command) == true {
-            let changed = model.selection.ids.symmetricDifference(ids)
-            if changed.count == 1 {
-                model.selectGesture(changed.first, command: true)
-                return
-            }
-        }
-        model.setSelectedIDs(ids, extending: shift)
-    }
-    private func activate(_ entry: CatalogEntry) {
-        if let saved = doubleClickSelection, saved.target == entry.id,
-           let event = NSApp.currentEvent, event.timestamp - saved.timestamp <= NSEvent.doubleClickInterval {
-            model.setSelectedIDs(saved.ids, primary: entry.id)
-        }
-        doubleClickSelection = nil
-        model.activate(entry)
-    }
     var body: some View {
         HSplitView {
             ScrollViewReader { proxy in
-            ScrollView(.horizontal) {
-                HStack(spacing: 0) {
-                    // Parent columns contain their immediate subfolders; no recursive scan.
-                    ForEach(Array(model.ancestors.dropLast()), id: \.path) { parent in
-                        FolderColumn(parent: parent, selected: model.ancestors, model: model)
-                        Divider()
+                ScrollView(.horizontal) {
+                    HStack(spacing: 0) {
+                        ForEach(model.visibleColumns) { column in
+                            VStack(alignment: .leading, spacing: 0) {
+                                Text(column.url.path == "/" ? "Mac" : column.url.lastPathComponent)
+                                    .font(.headline).lineLimit(1).padding(10)
+                                ColumnTable(model: model, column: column)
+                                if column.loading { ProgressView().controlSize(.small).padding(8) }
+                                else if let error = column.error {
+                                    Text(error).font(.caption).foregroundStyle(.secondary).padding(10)
+                                    Button("Повторить") { model.reload() }.padding(.bottom, 8)
+                                } else if column.entries.isEmpty {
+                                    Text("Папка пуста").font(.caption).foregroundStyle(.secondary).padding(10)
+                                }
+                            }.frame(width: 250).id(column.id)
+                            if column.id != model.visibleColumns.last?.id { Divider() }
+                        }
                     }
-                    VStack(alignment: .leading) {
-                        Text(model.folder?.lastPathComponent ?? "Папка").font(.headline).padding(10)
-                        ScrollViewReader { selectionProxy in
-                        List(model.entries, selection: Binding(get: { model.selection.ids }, set: { updateSelection($0) })) { entry in
-                            Label(entry.name, systemImage: entry.isFolder ? "folder" : "photo")
-                                .id(entry.id).tag(entry.id)
-                                .onTapGesture(count: 2) { activate(entry) }
-                                .contextMenu { if entry.isFolder { Button("Открыть") { model.open(entry.url) } } }
-                        }
-                        .disabled(model.busy)
-                        .onChange(of: SelectionScrollRequest(model), initial: true) { _, request in
-                            if let id = request.id, request.entries.contains(id) {
-                                selectionProxy.scrollTo(id)
-                            }
-                        }
-                        }
-                    }.frame(width: 250).id("current-folder")
                 }
-            }
-            // Wait for actual content and viewport geometry. Scroll offset is
-            // deliberately excluded, so manual horizontal scrolling stays put.
-            .onScrollGeometryChange(for: ColumnScrollGeometry.self) { geometry in
-                ColumnScrollGeometry(contentWidth: geometry.contentSize.width, viewportWidth: geometry.containerSize.width)
-            } action: { _, geometry in
-                if geometry.contentWidth > 0, geometry.viewportWidth > 0 {
-                    proxy.scrollTo("current-folder", anchor: .trailing)
+                .onScrollGeometryChange(for: ColumnScrollGeometry.self) { geometry in
+                    ColumnScrollGeometry(contentWidth: geometry.contentSize.width, viewportWidth: geometry.containerSize.width)
+                } action: { _, geometry in
+                    if geometry.contentWidth > 0, geometry.viewportWidth > 0,
+                       let last = model.visibleColumns.last { proxy.scrollTo(last.id, anchor: .trailing) }
                 }
-            }
-            }.id(model.folder).frame(minWidth: 260)
+                .onChange(of: model.columnFocusRevision) { _, _ in
+                    if let id = model.activeColumnID { proxy.scrollTo(id) }
+                }
+            }.frame(minWidth: 260)
             PreviewPane(model: model).frame(minWidth: 280)
-        }
+        }.task { model.prepareColumns() }
     }
 }
 
-struct FolderColumn: View {
-    let parent: URL
-    let selected: [URL]
+/// All columns use this table: hit testing belongs to the entire row, including
+/// the icon, label and trailing blank space, rather than individual cell views.
+@MainActor final class ColumnTableView: NSTableView {
+    weak var browserModel: BrowserModel?
+    var columnID = ""
+    var clickRow: ((Int?, NSEvent) -> Void)?
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let hit = super.hitTest(point) else { return nil }
+        let local = convert(point, from: superview)
+        return row(at: local) >= 0 ? self : hit
+    }
+    override func becomeFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder()
+        if accepted { browserModel?.focusColumn(columnID) }
+        return accepted
+    }
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        let row = row(at: convert(event.locationInWindow, from: nil))
+        clickRow?(row >= 0 ? row : nil, event)
+    }
+    override func keyDown(with event: NSEvent) {
+        if let browserModel,
+           BrowserKeyboard.handle(event, model: browserModel, firstResponder: self) { return }
+        super.keyDown(with: event)
+    }
+}
+
+struct ColumnTable: NSViewRepresentable {
     let model: BrowserModel
-    @State private var folders: [URL] = []
-    var body: some View {
-        VStack(alignment: .leading) {
-            Text(parent.path == "/" ? "Mac" : parent.lastPathComponent).font(.headline).padding(10)
-            List(folders, id: \.path) { folder in
-                Button { model.open(folder) } label: {
-                    HStack { Label(folder.lastPathComponent, systemImage: "folder"); Spacer(); Image(systemName: "chevron.right") }
-                }.buttonStyle(.plain)
-                    .help("Открыть папку «\(folder.lastPathComponent)»")
-                    .listRowBackground(selected.contains(folder) ? Color.accentColor.opacity(0.15) : .clear)
+    let column: BrowserColumn
+    func makeCoordinator() -> Coordinator { Coordinator(model, column: column) }
+    func makeNSView(context: Context) -> NSScrollView {
+        let table = ColumnTableView()
+        table.browserModel = model; table.columnID = column.id
+        table.headerView = nil; table.rowHeight = 30; table.intercellSpacing = NSSize(width: 0, height: 0)
+        table.allowsMultipleSelection = true; table.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
+        let name = NSTableColumn(identifier: .init("entry")); name.width = 250
+        table.addTableColumn(name)
+        table.delegate = context.coordinator; table.dataSource = context.coordinator
+        table.clickRow = { [weak coordinator = context.coordinator] row, event in coordinator?.click(row, event: event) }
+        let scroll = SelectionScrollView()
+        scroll.documentView = table; scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true
+        context.coordinator.table = table
+        return scroll
+    }
+    func updateNSView(_ scroll: NSScrollView, context: Context) {
+        let coordinator = context.coordinator
+        coordinator.model = model; coordinator.column = column
+        guard let table = coordinator.table else { return }
+        coordinator.updating = true
+        if coordinator.entries != column.entries { coordinator.entries = column.entries; table.reloadData() }
+        coordinator.syncSelection()
+        coordinator.updating = false
+        let selection = model.columnSelection(column)
+        let request = ColumnRevealRequest(mode: model.mode, ids: selection, entries: column.entries.map(\.id))
+        if coordinator.revealRequest != request, let scroll = scroll as? SelectionScrollView {
+            coordinator.revealRequest = request
+            scroll.revealSelection = { [weak table, weak coordinator] in
+                guard let table, let coordinator, coordinator.revealRequest == request,
+                      let index = coordinator.entries.firstIndex(where: { $0.id == coordinator.model.selection.id && selection.contains($0.id) })
+                        ?? coordinator.entries.firstIndex(where: { selection.contains($0.id) }) else { return }
+                table.scrollRowToVisible(index)
             }
-        }.frame(width: 190)
-        .task(id: parent) {
-            let root = parent
-            folders = await Task.detached {
-                let urls = (try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])) ?? []
-                return urls.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
-                    .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
-            }.value
+            scroll.needsLayout = true
+        }
+        if model.activeColumnID == column.id, coordinator.focusRevision != model.columnFocusRevision {
+            coordinator.focusRevision = model.columnFocusRevision
+            if model.columnFocusRevision > 0, let window = table.window,
+               !(window.firstResponder is NSTextView), NSApp.modalWindow == nil {
+                window.makeFirstResponder(table)
+            }
+        }
+    }
+    struct ColumnRevealRequest: Equatable {
+        let mode: ViewMode
+        let ids: Set<String>
+        let entries: [String]
+    }
+    @MainActor final class Coordinator: NSObject, NSTableViewDelegate, NSTableViewDataSource {
+        var model: BrowserModel
+        var column: BrowserColumn
+        var entries: [CatalogEntry] = []
+        weak var table: ColumnTableView?
+        var updating = false
+        var revealRequest: ColumnRevealRequest?
+        var focusRevision: Int?
+        private var beforeClick: Set<String>?
+        private var clickedID: String?
+        init(_ model: BrowserModel, column: BrowserColumn) { self.model = model; self.column = column }
+        func numberOfRows(in tableView: NSTableView) -> Int { entries.count }
+        func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+            let entry = entries[row]
+            let cell = NSTableCellView()
+            let image = NSImageView()
+            image.image = NSImage(systemSymbolName: entry.isFolder ? "folder.fill" : "photo", accessibilityDescription: entry.kind)
+            image.contentTintColor = entry.isFolder ? .systemBlue : .secondaryLabelColor
+            let label = NSTextField(labelWithString: entry.name)
+            label.lineBreakMode = .byTruncatingMiddle
+            image.translatesAutoresizingMaskIntoConstraints = false; label.translatesAutoresizingMaskIntoConstraints = false
+            cell.addSubview(image); cell.addSubview(label); cell.imageView = image; cell.textField = label
+            NSLayoutConstraint.activate([
+                image.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 8),
+                image.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+                image.widthAnchor.constraint(equalToConstant: 18), image.heightAnchor.constraint(equalToConstant: 18),
+                label.leadingAnchor.constraint(equalTo: image.trailingAnchor, constant: 6),
+                label.trailingAnchor.constraint(lessThanOrEqualTo: cell.trailingAnchor, constant: -8),
+                label.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
+            ])
+            return cell
+        }
+        func syncSelection() {
+            let saved = updating; updating = true
+            let selected = model.columnSelection(column)
+            table?.selectRowIndexes(IndexSet(entries.indices.filter { selected.contains(entries[$0].id) }), byExtendingSelection: false)
+            updating = saved
+        }
+        func click(_ row: Int?, event: NSEvent) {
+            let id = row.flatMap { entries.indices.contains($0) ? entries[$0].id : nil }
+            var restored: Set<String>?
+            if event.clickCount == 2, clickedID == id, let id, beforeClick?.contains(id) == true { restored = beforeClick }
+            if event.clickCount == 1 {
+                beforeClick = column.url == model.folder || model.columns.isEmpty ? model.selection.ids : nil
+                clickedID = id
+            }
+            model.clickColumn(column.id, entryID: id, command: event.modifierFlags.contains(.command),
+                              shift: event.modifierFlags.contains(.shift), doubleClick: event.clickCount == 2, restoring: restored)
+            syncSelection()
+        }
+        func tableViewSelectionDidChange(_ notification: Notification) {
+            guard !updating, let table else { return }
+            // Accessibility/native selection actions use the same model transition.
+            let ids = table.selectedRowIndexes.compactMap { entries.indices.contains($0) ? entries[$0].id : nil }
+            if let id = ids.first { model.clickColumn(column.id, entryID: id) }
+            else { model.clickColumn(column.id, entryID: nil) }
+            syncSelection()
         }
     }
 }

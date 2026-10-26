@@ -101,7 +101,7 @@ public actor PhotoLibrary {
     }
     public init(root: URL) { self.root = root.standardizedFileURL }
     private var manifestURL: URL { root.appendingPathComponent("library.json") }
-    private func load() throws -> Manifest {
+    private func load(recoverPendingDeletions: Bool = true) throws -> Manifest {
         guard root.path == root.resolvingSymlinksInPath().path else { throw LibraryFiles.fail("Библиотека не может быть символьной ссылкой") }
         guard FileManager.default.fileExists(atPath: manifestURL.path) else {
             if FileManager.default.fileExists(atPath: root.appendingPathComponent("Originals").path) {
@@ -122,7 +122,7 @@ public actor PhotoLibrary {
             result.records[index].pendingDeletion = nil
             recovered = true
         }
-        if recovered { try save(result) }
+        if recovered && recoverPendingDeletions { try save(result) }
         return result
     }
     private func save(_ manifest: Manifest) throws {
@@ -142,6 +142,19 @@ public actor PhotoLibrary {
             } catch { issues.append("\(url.lastPathComponent): \(error.localizedDescription)") }
         }
         return LibrarySnapshot(entries: FolderCatalog.sorted(FolderCatalog.pair(resources).map { CatalogEntry(url: $0.preferred.url, asset: $0) }), issues: issues)
+    }
+    /// ZIP export is a read-only manifest snapshot, including pending-delete
+    /// interpretation but never writing recovery state back to the library.
+    public func zipSource(selectedResources: Set<URL>? = nil) throws -> ZIPSource {
+        let manifest = try load(recoverPendingDeletions: false)
+        let records = manifest.records.filter { !$0.deleted }
+        var chosen = records.filter { selectedResources == nil || selectedResources!.contains(root.appendingPathComponent($0.stored)) }
+        if let selectedResources, chosen.count != selectedResources.count { throw LibraryFiles.fail("Выбранный ресурс отсутствует в каталоге библиотеки") }
+        chosen = try chosen.filter { try !ZIPExporter.isHidden(relativePath: $0.stored, root: root) }
+        for record in chosen { try LibraryFiles.checkRegular(root.appendingPathComponent(record.stored)) }
+        if chosen.isEmpty { return ZIPSource(root: root, archiveName: root.lastPathComponent, relativePaths: [], requiresRegularFiles: true) }
+        return ZIPSource(root: root.appendingPathComponent("Originals"), archiveName: root.lastPathComponent,
+                         relativePaths: chosen.map { String($0.stored.dropFirst("Originals/".count)) }, requiresRegularFiles: true)
     }
     public func importPhotos(from source: URL) throws -> ImportReport {
         let source = source.standardizedFileURL

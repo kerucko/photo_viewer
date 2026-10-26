@@ -113,8 +113,16 @@ import PhotoCore
         for mode in ViewMode.allCases {
             model.mode = mode
             model.setSelectedIDs([photoIDs[2], photoIDs[4]], primary: photoIDs[4])
-            #expect(BrowserKeyboard.handle(right, model: model, firstResponder: NSView()))
-            #expect(model.selection.ids == [photoIDs[5]])
+            if mode == .columns {
+                #expect(!BrowserKeyboard.handle(right, model: model, firstResponder: NSView()))
+                let table = ColumnTableView(); table.browserModel = model
+                table.columnID = model.visibleColumns[0].id
+                #expect(BrowserKeyboard.handle(right, model: model, firstResponder: table))
+                #expect(model.selection.ids == [photoIDs[2], photoIDs[4]]) // Right is folder navigation.
+            } else {
+                #expect(BrowserKeyboard.handle(right, model: model, firstResponder: NSView()))
+                #expect(model.selection.ids == [photoIDs[5]])
+            }
         }
         #expect(!BrowserKeyboard.handle(try key(124, flags: .shift), model: model, firstResponder: NSView()))
     }
