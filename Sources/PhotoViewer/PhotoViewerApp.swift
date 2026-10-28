@@ -3,16 +3,23 @@ import AppKit
 import PhotoCore
 
 @main struct PhotoViewerApp: App {
+    @NSApplicationDelegateAdaptor(PhotoViewerLifecycle.self) private var lifecycle
     @State private var model = BrowserModel()
     var body: some Scene {
         Window("Фото", id: "main") {
             BrowserView(model: model)
                 .frame(minWidth: 850, minHeight: 560)
+                .onAppear { PhotoViewerLifecycle.model = model }
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in model.reload() }
         }
         .defaultSize(width: 1180, height: 780)
         .commands {
             CommandMenu("Вид") {
+                Button("Редактировать") { model.startEditing() }.keyboardShortcut("e", modifiers: .command).disabled(!model.canEdit)
+                Menu("Сетка") {
+                    Picker("Сетка", selection: $model.grid) { ForEach(PhotoGrid.allCases, id: \.self) { Text($0.title).tag($0) } }
+                }
+                Divider()
                 Button("Сравнить выбранные") { model.startComparison() }.disabled(!model.canCompare)
                 Divider()
                 Button("Увеличить") { model.zoom(by: 1.4) }
@@ -25,7 +32,7 @@ import PhotoCore
                     .keyboardShortcut("1", modifiers: .command).disabled(!model.canZoom)
                 Divider()
                 Toggle("Показать сведения", isOn: $model.showMetadata)
-                    .keyboardShortcut("i", modifiers: .command)
+                    .keyboardShortcut("i", modifiers: .command).disabled(model.editor != nil)
                 Menu("Размер миниатюр в галерее") {
                     Picker("Размер", selection: $model.filmstripSize) {
                         ForEach(FilmstripSize.allCases, id: \.self) { size in Text(size.title).tag(size) }
@@ -33,15 +40,15 @@ import PhotoCore
                 }
             }
             CommandGroup(replacing: .newItem) {
-                Button("Открыть папку…") { model.chooseFolder() }.keyboardShortcut("o")
-                Button("Открыть библиотеку…") { model.chooseLibrary() }.disabled(model.busy)
-                Button("Библиотека") { model.openLibrary() }.disabled(model.busy)
-                Button("Импортировать с SD…") { model.chooseImport() }.disabled(model.busy)
+                Button("Открыть папку…") { model.chooseFolder() }.keyboardShortcut("o").disabled(model.interactionLocked)
+                Button("Открыть библиотеку…") { model.chooseLibrary() }.disabled(model.interactionLocked)
+                Button("Библиотека") { model.openLibrary() }.disabled(model.interactionLocked)
+                Button("Импортировать с SD…") { model.chooseImport() }.disabled(model.interactionLocked)
                 Button("Создать ZIP-архив…") { model.createZIP() }.disabled(!model.canExportZIP)
                 Divider()
                 Button(model.comparison == nil ? "Переместить выбранные снимки в Корзину…" : "Переместить активный снимок в Корзину…") { model.confirmTrash() }
                     .keyboardShortcut(.delete, modifiers: .command).disabled(!model.canTrash)
-                Button("Обновить") { model.reload() }.keyboardShortcut("r").disabled(model.busy)
+                Button("Обновить") { model.reload() }.keyboardShortcut("r").disabled(model.interactionLocked)
             }
         }
     }
@@ -133,7 +140,7 @@ struct NavigationToolbarView: View {
 
 @MainActor enum BrowserKeyboard {
     static func handle(_ event: NSEvent, model: BrowserModel, firstResponder: NSResponder?) -> Bool {
-        guard !model.busy, NSApp.modalWindow == nil, !(firstResponder is NSTextView), !(firstResponder is NSTextField) else { return false }
+        guard !model.interactionLocked, NSApp.modalWindow == nil, !(firstResponder is NSTextView), !(firstResponder is NSTextField) else { return false }
         let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
         if model.mode == .columns {
             guard let table = firstResponder as? ColumnTableView, table.browserModel === model else { return false }
@@ -195,6 +202,13 @@ struct BrowserView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if model.editor == nil, let id = model.selection.id, let warning = model.editWarnings[id] {
+                HStack {
+                    Label(warning, systemImage: "exclamationmark.triangle").font(.callout).lineLimit(3)
+                    Spacer(minLength: 8)
+                }.padding(10)
+                Divider()
+            }
             if !model.catalogIssues.isEmpty {
                 HStack {
                     Label("Недоступные файлы: \(model.catalogIssues.count). Остальные фотографии доступны.", systemImage: "exclamationmark.triangle")
@@ -205,7 +219,9 @@ struct BrowserView: View {
                 }.font(.callout).padding(10)
                 Divider()
             }
-            if let error = model.error, model.mode != .columns {
+            if let editor = model.editor {
+                PhotoEditorView(model: model, session: editor)
+            } else if let error = model.error, model.mode != .columns {
                 ContentUnavailableView { Label("Папка недоступна", systemImage: "externaldrive.badge.exclamationmark") } description: { Text(error) } actions: { Button("Повторить") { model.reload() }.help("Повторить загрузку папки (⌘R)") }
             } else if model.folder == nil {
                 ContentUnavailableView { Label("Ваши фотографии", systemImage: "photo.on.rectangle.angled") } description: { Text("Откройте папку или перетащите её сюда.\nJPG и RAF одного снимка будут показаны вместе.") } actions: { Button("Открыть папку…") { model.chooseFolder() }.buttonStyle(.borderedProminent).help("Открыть папку с фотографиями (⌘O)") }
@@ -220,7 +236,7 @@ struct BrowserView: View {
                     Text("В папке нет JPG, RAF или вложенных папок").foregroundStyle(.secondary).padding()
                 }
             }
-            if model.mode != .gallery {
+            if model.mode != .gallery, model.editor == nil {
                 Divider()
                 HStack {
                     Text(model.selected?.name ?? "Нет выделения").lineLimit(1)
@@ -233,14 +249,16 @@ struct BrowserView: View {
             }
         }
         .disabled(model.busy)
-        .inspector(isPresented: $model.showMetadata) {
-            MetadataSidebar(entry: model.selected, resource: model.selectedResource)
+        .background(EditorWindowGuard(model: model).frame(width: 0, height: 0))
+        .inspector(isPresented: Binding(get: { model.showMetadata && model.editor == nil }, set: { if model.editor == nil { model.showMetadata = $0 } })) {
+            MetadataSidebar(entry: model.selected, resource: model.selectedResource, resultingSize: model.resultingSize)
                 .inspectorColumnWidth(min: 240, ideal: 280, max: 380)
         }
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { contentWidth = $0 }
         .sheet(item: $model.zipSession) { ZIPExportView(session: $0) }
         .navigationTitle("")
         .toolbar {
+            if model.editor == nil {
             navigationToolbar
             if model.mode != .gallery {
                 ToolbarItem {
@@ -253,7 +271,7 @@ struct BrowserView: View {
                 ToolbarItem {
                     if model.comparison != nil {
                         Button("Завершить сравнение", systemImage: "xmark.rectangle") { model.exitComparison() }
-                            .disabled(model.busy).help("Вернуться к активному снимку в галерее (Esc)")
+                            .disabled(model.interactionLocked).help("Вернуться к активному снимку в галерее (Esc)")
                     } else {
                         Button("Сравнить выбранные", systemImage: "rectangle.split.2x1") { model.startComparison() }
                             .disabled(!model.canCompare).help("Сравнить два выбранных снимка")
@@ -266,9 +284,9 @@ struct BrowserView: View {
                         viewModePicker
                     } label: {
                         Label("Вид", systemImage: viewModeSymbol)
-                    }.disabled(model.busy).help("Выбрать режим просмотра")
+                    }.disabled(model.interactionLocked).help("Выбрать режим просмотра")
                 } else {
-                    viewModePicker.pickerStyle(.segmented).frame(width: 180).disabled(model.busy)
+                    viewModePicker.pickerStyle(.segmented).frame(width: 180).disabled(model.interactionLocked)
                 }
             }
             if model.mode == .gallery {
@@ -308,7 +326,7 @@ struct BrowserView: View {
             }
             if model.mode == .icons {
                 ToolbarItem {
-                    Slider(value: $model.iconSize, in: 100...240).frame(width: 100).disabled(model.busy).help("Размер значков")
+                    Slider(value: $model.iconSize, in: 100...240).frame(width: 100).disabled(model.interactionLocked).help("Размер значков")
                 }
             }
             ToolbarItem {
@@ -318,7 +336,7 @@ struct BrowserView: View {
                     Button("Дата изменения") { model.setSort(.modified) }
                     Button("Размер") { model.setSort(.size) }
                 } label: { Label("Сортировка", systemImage: "arrow.up.arrow.down") }
-                .disabled(model.busy)
+                .disabled(model.interactionLocked)
                 .help("Выбрать порядок сортировки")
             }
             ToolbarItem {
@@ -326,16 +344,24 @@ struct BrowserView: View {
                     .disabled(model.busy || !model.canTrash).help(model.comparison == nil ? "Переместить все файлы выбранных снимков в Корзину (⌘⌫)" : "Переместить все файлы только активного снимка в Корзину (⌘⌫)")
             }
             ToolbarItem {
-                Button(action: model.reload) { Label("Обновить", systemImage: "arrow.clockwise") }.disabled(model.busy).help("Обновить (⌘R)")
+                Button(action: model.reload) { Label("Обновить", systemImage: "arrow.clockwise") }.disabled(model.interactionLocked).help("Обновить (⌘R)")
             }
-            ToolbarItem {
+            ToolbarItemGroup {
+                Button("Редактировать", systemImage: "crop.rotate") { model.startEditing() }.disabled(!model.canEdit).help("Кадрировать и повернуть снимок (⌘E)")
                 Button { model.showMetadata.toggle() } label: { Label("Сведения", systemImage: "sidebar.right") }
-                    .disabled(model.busy).help(model.showMetadata ? "Скрыть сведения (⌘I)" : "Показать сведения (⌘I)")
+                    .disabled(model.interactionLocked).help(model.showMetadata ? "Скрыть сведения (⌘I)" : "Показать сведения (⌘I)")
+            }
+            } else {
+                ToolbarItem(placement: .principal) {
+                    Text(model.editor?.asset.name ?? "Редактирование").font(.headline).lineLimit(1)
+                        .padding(.horizontal, 12).frame(height: 34)
+                        .background(.regularMaterial, in: Capsule())
+                }.sharedBackgroundVisibility(.hidden)
             }
         }
 
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
-            guard let provider = providers.first else { return false }
+            guard !model.interactionLocked, let provider = providers.first else { return false }
             _ = provider.loadObject(ofClass: URL.self) { url, _ in
                 guard let url, (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { return }
                 Task { @MainActor in model.open(url) }
@@ -354,6 +380,8 @@ struct BrowserView: View {
 
 struct Thumbnail: View {
     let asset: PhotoAsset
+    var edit: PhotoEdit = .identity
+    private struct Request: Equatable { let asset: PhotoAsset; let edit: PhotoEdit }
     @State private var image: RenderedImage?
     @State private var failed = false
     var body: some View {
@@ -362,9 +390,9 @@ struct Thumbnail: View {
             if let image { Image(decorative: image.cgImage, scale: 1).resizable().scaledToFit() }
             else { Image(systemName: failed ? "exclamationmark.triangle" : "photo").foregroundStyle(.secondary) }
         }
-        .task(id: asset) {
+        .task(id: Request(asset: asset, edit: edit)) {
             image = nil; failed = false
-            do { let result = try await ImageService.shared.image(asset.preferred, maxPixel: 480); if !Task.isCancelled { image = result } }
+            do { let result = try await ImageService.shared.image(asset.preferred, maxPixel: 480, edit: edit); if !Task.isCancelled { image = result } }
             catch { if !Task.isCancelled { failed = true } }
         }
     }
@@ -378,7 +406,7 @@ struct GalleryActionsToolbarView: View {
             if model.comparison != nil {
                 Button("Завершить сравнение", systemImage: "xmark.rectangle") { model.exitComparison() }
                     .labelStyle(.iconOnly)
-                    .disabled(model.busy).help("Вернуться к активному снимку в галерее (Esc)")
+                    .disabled(model.interactionLocked).help("Вернуться к активному снимку в галерее (Esc)")
             } else {
                 Button("Сравнить выбранные", systemImage: "rectangle.split.2x1") { model.startComparison() }
                     .labelStyle(.iconOnly)
@@ -386,7 +414,7 @@ struct GalleryActionsToolbarView: View {
             }
             if model.selected?.asset?.isPair == true {
                 Button(model.showsRAW ? "RAW → JPG" : "JPG → RAW") { model.toggleRAW() }
-                    .disabled(model.busy).help(model.showsRAW ? "Показать JPEG" : "Показать проявленный RAW")
+                    .disabled(model.interactionLocked).help(model.showsRAW ? "Показать JPEG" : "Показать проявленный RAW")
             } else if let asset = model.selected?.asset {
                 Text(asset.kind).foregroundStyle(.secondary)
             }
@@ -411,7 +439,7 @@ struct GalleryView: View {
                     LazyHStack(spacing: 10) {
                         ForEach(model.comparison == nil ? model.entries : model.photos) { entry in
                             VStack(spacing: 4) {
-                                if let asset = entry.asset { Thumbnail(asset: asset).frame(width: model.filmstripSize.width, height: model.filmstripSize.imageHeight) }
+                                if let asset = entry.asset { Thumbnail(asset: asset, edit: model.edit(for: asset)).frame(width: model.filmstripSize.width, height: model.filmstripSize.imageHeight) }
                                 else { Image(systemName: "folder.fill").font(.largeTitle).frame(width: model.filmstripSize.width, height: model.filmstripSize.imageHeight) }
                                 Text(entry.name).font(.caption).lineLimit(1).frame(width: model.filmstripSize.width)
                             }.padding(5).background(model.selection.ids.contains(entry.id) ? Color.accentColor.opacity(model.selection.id == entry.id ? 0.35 : 0.15) : .clear, in: RoundedRectangle(cornerRadius: 8))
@@ -433,7 +461,7 @@ struct PreviewPane: View {
     var body: some View {
         ZStack {
             Color(nsColor: .underPageBackgroundColor)
-            if let image = model.preview { ZoomCanvas(image: image.cgImage, state: $model.viewport) }
+            if let image = model.preview { ZoomCanvas(image: image.cgImage, state: $model.viewport, grid: model.grid) }
             else if model.previewLoading { ProgressView("Загрузка изображения…") }
             else if let error = model.previewError { ContentUnavailableView("Не удалось открыть фото", systemImage: "exclamationmark.triangle", description: Text(error)) }
             else { ContentUnavailableView("Выберите фотографию", systemImage: "photo") }

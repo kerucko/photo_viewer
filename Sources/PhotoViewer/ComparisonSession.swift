@@ -20,12 +20,17 @@ import PhotoCore
     private var tasks: [Int: Task<Void, Never>] = [:]
     @ObservationIgnored private var geometry: [Int: (CGSize, CGFloat)] = [:]
     private let loader: Loader
-    init(assets: [PhotoAsset], primary: String?, loader: @escaping Loader = { try await ImageService.shared.image($0, maxPixel: nil) }) {
+    private var recipes: [URL: PhotoEdit]
+    init(assets: [PhotoAsset], primary: String?, recipes: [URL: PhotoEdit] = [:], loader: @escaping Loader = { try await ImageService.shared.image($0, maxPixel: nil) }) {
         precondition(assets.count == 2 && assets[0].id != assets[1].id)
         panes = assets.map { Pane(asset: $0) }
         active = assets.firstIndex { $0.id == primary } ?? 0
-        self.loader = loader
+        self.loader = loader; self.recipes = recipes
         for index in panes.indices { load(index) }
+    }
+    func setRecipes(_ recipes: [URL: PhotoEdit]) {
+        let old = self.recipes; self.recipes = recipes
+        for index in panes.indices where (old[panes[index].resource.url] ?? .identity) != (recipes[panes[index].resource.url] ?? .identity) { load(index) }
     }
     var activePane: Pane { panes[active] }
     func cancel() {
@@ -65,11 +70,12 @@ import PhotoCore
     private func load(_ index: Int) {
         tasks[index]?.cancel()
         let request = UUID(), resource = panes[index].resource, loader = loader
+        let edit = recipes[resource.url] ?? .identity
         panes[index].request = request; panes[index].loading = true
         panes[index].image = nil; panes[index].error = nil
         tasks[index] = Task { [weak self] in
             do {
-                let image = try await loader(resource)
+                let image = try await (edit.isIdentity ? loader(resource) : ImageService.shared.image(resource, maxPixel: nil, edit: edit))
                 guard !Task.isCancelled, let self, panes[index].request == request else { return }
                 panes[index].image = image; panes[index].loading = false
             } catch {
@@ -96,7 +102,7 @@ struct ComparisonView: View {
                     ZStack {
                         Color(nsColor: .underPageBackgroundColor)
                         if let image = pane.image {
-                            ZoomCanvas(image: image.cgImage, state: $session.viewport,
+                            ZoomCanvas(image: image.cgImage, state: $session.viewport, grid: model.grid,
                                        canInteract: { !model.busy },
                                        onActivate: { model.activateComparisonPane(index) },
                                        onGeometry: { session.setGeometry($0, backingScale: $1, for: index) },

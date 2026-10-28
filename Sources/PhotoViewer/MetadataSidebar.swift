@@ -4,6 +4,7 @@ import PhotoCore
 struct MetadataSidebar: View {
     let entry: CatalogEntry?
     let resource: PhotoResource?
+    var resultingSize: CGSize? = nil
     @State private var metadata: PhotoMetadata?
     @State private var error: String?
     @State private var loading = false
@@ -29,6 +30,12 @@ struct MetadataSidebar: View {
                             }
                             Text("Показаны данные: \(resource?.url.lastPathComponent ?? entry.name)")
                                 .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    if let resultingSize {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Размер после правок").font(.caption).foregroundStyle(.secondary)
+                            Text("\(Int(resultingSize.width)) × \(Int(resultingSize.height))").font(.callout)
                         }
                     }
                     if loading { ProgressView("Чтение метаданных…") }

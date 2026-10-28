@@ -72,3 +72,24 @@ private func expectTrue(_ value: Bool, sourceLocation: SourceLocation = #_source
 private func expectFalse(_ value: Bool, sourceLocation: SourceLocation = #_sourceLocation) {
     #expect(!value, sourceLocation: sourceLocation)
 }
+
+struct ResourceGenerationTests {
+    @Test func catalogGenerationChangesOnlyAfterActualFileChange() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let url = folder.appendingPathComponent("one.jpg")
+        let date = Date(timeIntervalSince1970: 1_500_000_000)
+        try Data("first".utf8).write(to: url)
+        try FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: url.path)
+        let before = try #require(FolderCatalog().contents(of: folder).first?.asset)
+        #expect(try FolderCatalog().contents(of: folder).first?.asset == before)
+        try Data("other".utf8).write(to: url, options: .atomic)
+        try FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: url.path)
+        let after = try #require(FolderCatalog().contents(of: folder).first?.asset)
+        #expect(before.id == after.id); #expect(before.size == after.size); #expect(before.modified == after.modified)
+        #expect(before != after)
+        #expect(before.preferred.fileGeneration != after.preferred.fileGeneration)
+        #expect(try FolderCatalog().contents(of: folder).first?.asset == after)
+    }
+}

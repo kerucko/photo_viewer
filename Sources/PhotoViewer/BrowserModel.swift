@@ -3,7 +3,7 @@ import SwiftUI
 import PhotoCore
 
 @MainActor @Observable final class BrowserModel {
-    enum Location: Equatable, Sendable {
+    enum Location: Hashable, Sendable {
         case folder(URL), library(URL)
         var url: URL { switch self { case .folder(let url), .library(let url): url } }
     }
@@ -13,7 +13,7 @@ import PhotoCore
     var libraryRoot: URL? = UserDefaults.standard.url(forKey: "libraryRoot")
     private var library: PhotoLibrary?
     var zipSession: ZIPExportSession?
-    var canExportZIP: Bool { location != nil && !busy && !loading }
+    var canExportZIP: Bool { location != nil && !interactionLocked && !loading }
     func createZIP() {
         guard canExportZIP, let location else { return }
         beginOperation("Создание ZIP-архива…")
@@ -22,14 +22,25 @@ import PhotoCore
             zipSession = nil; finishOperation()
         }
     }
+    var editor: EditorSession?
+    var interactionLocked: Bool { busy || editor != nil }
+    var edits: [String: PhotoEdit] = [:]
+    var editWarnings: [String: String] = [:]
+    var editRevision = 0
+    var grid = PhotoGrid(rawValue: UserDefaults.standard.string(forKey: "photoGrid") ?? "") ?? .off {
+        didSet { UserDefaults.standard.set(grid.rawValue, forKey: "photoGrid") }
+    }
+    private var editStores: [Location: PhotoEditStore] = [:]
+    private var deferredReload = false
+    private var previewRequest = UUID()
     var busy = false
     var operationTitle = ""
     var selectedAssets: [PhotoAsset] { entries.filter { selection.ids.contains($0.id) }.compactMap(\.asset) }
     var trashAssets: [PhotoAsset] { comparison.map { [$0.activePane.asset] } ?? selectedAssets }
-    var showsRAW: Bool { comparison?.activePane.showsRAW ?? selection.showsRAW }
-    var canTrash: Bool { !trashAssets.isEmpty && !busy && !loading }
-    var canSelectAll: Bool { mode != .gallery && !photos.isEmpty && !busy }
-    var canUp: Bool { !busy && !isLibrary && folder != nil && folder?.path != "/" }
+    var showsRAW: Bool { editor?.showsRAW ?? comparison?.activePane.showsRAW ?? selection.showsRAW }
+    var canTrash: Bool { !trashAssets.isEmpty && !interactionLocked && !loading }
+    var canSelectAll: Bool { mode != .gallery && !photos.isEmpty && !interactionLocked }
+    var canUp: Bool { !interactionLocked && !isLibrary && folder != nil && folder?.path != "/" }
     var entries: [CatalogEntry] = []
     var selection = SelectionState()
     var loading = false
@@ -59,27 +70,31 @@ import PhotoCore
     private var prefetchTask: Task<Void, Never>?
     private var priorMode: ViewMode = .icons
     private let catalog: any CatalogSource
+    private let editStoreFactory: (Location) -> PhotoEditStore
     private(set) var columns: [BrowserColumn] = []
     private(set) var activeColumnID: String?
     private(set) var columnFocusRevision = 0
     private var columnTasks: [String: Task<Void, Never>] = [:]
     private var suspendedColumnIDs: Set<String> = []
-    init(catalog: any CatalogSource = FolderCatalog()) {
-        self.catalog = catalog
+    init(catalog: any CatalogSource = FolderCatalog(), editStoreFactory: @escaping (Location) -> PhotoEditStore = { location in
+        PhotoEditStore(folder: location.url, libraryRoot: { if case .library(let root) = location { return root }; return nil }())
+    }) {
+        self.catalog = catalog; self.editStoreFactory = editStoreFactory
         selection.mode = ViewMode(rawValue: UserDefaults.standard.string(forKey: "mode") ?? "") ?? .icons
     }
     var selected: CatalogEntry? { entries.first { $0.id == selection.id } }
     var selectedResource: PhotoResource? {
+        if let editor { return editor.resource }
         if let comparison { return comparison.activePane.resource }
         guard let asset = selected?.asset else { return nil }
         return selection.showsRAW ? (asset.raw ?? asset.preferred) : asset.preferred
     }
-    var canZoom: Bool { !busy && (comparison?.activePane.image != nil || preview != nil) && (mode == .gallery || mode == .columns) }
+    var canZoom: Bool { !interactionLocked && (comparison?.activePane.image != nil || preview != nil) && (mode == .gallery || mode == .columns) }
     var photos: [CatalogEntry] { entries.filter { !$0.isFolder } }
     var mode: ViewMode {
         get { selection.mode }
         set {
-            guard !busy else { return }
+            guard !interactionLocked else { return }
             if comparison != nil { exitComparison() }
             let previous = selection.mode
             selection.mode = newValue; UserDefaults.standard.set(newValue.rawValue, forKey: "mode")
@@ -99,7 +114,7 @@ import PhotoCore
         return result
     }
     func chooseFolder() {
-        guard !busy else { return }
+        guard !interactionLocked else { return }
         let panel = NSOpenPanel(); panel.canChooseDirectories = true; panel.canChooseFiles = false
         panel.allowsMultipleSelection = false; panel.prompt = "Открыть"; panel.message = "Выберите папку с фотографиями"
         if panel.runModal() == .OK, let url = panel.url { open(url) }
@@ -108,7 +123,7 @@ import PhotoCore
         navigate(.folder(url), recordHistory: recordHistory)
     }
     private func navigate(_ destination: Location, recordHistory: Bool = true) {
-        guard !busy else { return }
+        guard !interactionLocked else { return }
         if recordHistory && location != destination {
             history = Array(history.prefix(historyIndex + 1)); history.append(destination); historyIndex = history.count - 1
         }
@@ -125,21 +140,26 @@ import PhotoCore
         cancelColumnTasks(); columns = []; activeColumnID = nil
         reload()
     }
-    func back() { guard !busy, canBack else { return }; historyIndex -= 1; navigate(history[historyIndex], recordHistory: false) }
-    func forward() { guard !busy, canForward else { return }; historyIndex += 1; navigate(history[historyIndex], recordHistory: false) }
+    func back() { guard !interactionLocked, canBack else { return }; historyIndex -= 1; navigate(history[historyIndex], recordHistory: false) }
+    func forward() { guard !interactionLocked, canForward else { return }; historyIndex += 1; navigate(history[historyIndex], recordHistory: false) }
     func up() { guard canUp, let folder else { return }; open(folder.deletingLastPathComponent()) }
     func reload() {
-        guard !busy else { return }
+        if editor != nil { deferredReload = true; return }
+        guard !interactionLocked else { return }
         if mode == .columns, !isLibrary, !columns.isEmpty {
             for column in columns { loadColumn(column.id) }; return
         }
+        guard location != nil else { return }
+        // Publish the pending state before yielding: callers must never observe
+        // an empty newly opened catalog as a completed load.
+        loading = true; error = nil
         Task { await refresh() }
     }
     private func refresh(nearest index: Int? = nil, comparisonTrash: (ComparisonTrashSnapshot, Bool)? = nil) async {
         if mode == .columns, !isLibrary, !columns.isEmpty {
             for column in columns { loadColumn(column.id, nearest: index) }; return
         }
-        guard let location else { return }
+        guard editor == nil, let location else { return }
         folderRevision += 1; let revision = folderRevision
         loading = true; error = nil
         let source = catalog
@@ -153,7 +173,9 @@ import PhotoCore
                 let snapshot = try await library!.snapshot()
                 contents = snapshot.entries; issues = snapshot.issues
             }
-            guard revision == folderRevision else { return }
+            guard revision == folderRevision, editor == nil else { return }
+            await loadEdits(for: contents, location: location, valid: { self.folderRevision == revision && self.location == location && self.editor == nil })
+            guard revision == folderRevision, editor == nil else { return }
             catalogIssues = issues
             entries = FolderCatalog.sorted(contents, by: sort, ascending: ascending)
             loading = false
@@ -164,14 +186,14 @@ import PhotoCore
             selectFirstOnRefresh = false
             loadPreview()
         } catch {
-            guard revision == folderRevision else { return }
+            guard revision == folderRevision, editor == nil else { return }
             if comparison != nil { endComparison() }
             entries = []; catalogIssues = []; selection.select(nil); loading = false
             self.error = "Папка недоступна. Проверьте подключение носителя и права доступа.\n\(error.localizedDescription)"
         }
     }
     @discardableResult func chooseLibrary() -> Bool {
-        guard !busy else { return false }
+        guard !interactionLocked else { return false }
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true; panel.canChooseFiles = false; panel.canCreateDirectories = true
         panel.prompt = "Выбрать библиотеку"
@@ -181,11 +203,11 @@ import PhotoCore
         navigate(.library(root)); return true
     }
     func openLibrary() {
-        guard !busy else { return }
+        guard !interactionLocked else { return }
         if let libraryRoot { navigate(.library(libraryRoot)) } else { chooseLibrary() }
     }
     func chooseImport() {
-        guard !busy else { return }
+        guard !interactionLocked else { return }
         if libraryRoot == nil && !chooseLibrary() { return }
         guard let root = libraryRoot else { return }
         let panel = NSOpenPanel()
@@ -300,7 +322,7 @@ import PhotoCore
         alert.runModal()
     }
     func setSort(_ field: CatalogSort) {
-        guard !busy else { return }
+        guard !interactionLocked else { return }
         if sort == field { ascending.toggle() } else { sort = field; ascending = true }
         UserDefaults.standard.set(sort.rawValue, forKey: "sort"); UserDefaults.standard.set(ascending, forKey: "ascending")
         entries = FolderCatalog.sorted(entries, by: sort, ascending: ascending)
@@ -309,13 +331,13 @@ import PhotoCore
         }
     }
     private func changeSelection(_ change: (inout SelectionState) -> Void) {
-        guard !busy else { return }
+        guard !interactionLocked else { return }
         let prior = selection.id
         change(&selection)
         if prior != selection.id { viewport = ViewportState(); loadPreview() }
     }
     func select(_ id: String?) {
-        guard !busy else { return }
+        guard !interactionLocked else { return }
         if comparison != nil { if let id { replaceComparison(with: id) }; return }
         selectFirstOnRefresh = false
         changeSelection { $0.select(id) }
@@ -355,6 +377,7 @@ import PhotoCore
         changeSelection { $0.replace(Set(ids), primary: $0.id, orderedIDs: ids) }
     }
     func reconcileSelection(nearest index: Int? = nil, selectFirstIfEmpty: Bool = false) {
+        guard editor == nil else { return }
         if comparison != nil { reconcileComparison(); return }
         let hadSelection = !selection.ids.isEmpty
         let prior = selection.id
@@ -365,7 +388,7 @@ import PhotoCore
         if prior != selection.id { viewport = ViewportState() }
     }
     func activate(_ entry: CatalogEntry) {
-        guard !busy else { return }
+        guard !interactionLocked else { return }
         if comparison != nil, !entry.isFolder { replaceComparison(with: entry.id); return }
         if entry.isFolder { open(entry.url) }
         else {
@@ -375,7 +398,7 @@ import PhotoCore
         }
     }
     func toggleGallery() {
-        guard !busy else { return }
+        guard !interactionLocked else { return }
         if comparison != nil { exitComparison() }
         if mode == .gallery { mode = priorMode }
         else if selected?.asset != nil { priorMode = mode; mode = .gallery }
@@ -387,17 +410,19 @@ import PhotoCore
         select(photos[min(max(current + delta, 0), photos.count - 1)].id)
     }
     func extendSelection(by delta: Int) {
-        guard !busy, !photos.isEmpty else { return }
+        guard !interactionLocked, !photos.isEmpty else { return }
         let current = photos.firstIndex { $0.id == selection.id } ?? (delta > 0 ? -1 : photos.count)
         selectGesture(photos[min(max(current + delta, 0), photos.count - 1)].id, shift: true)
     }
     func toggleRAW() {
         guard !busy else { return }
+        if let editor { editor.toggleRAW(); return }
         if let comparison { comparison.toggleRAW(); syncComparisonSelection(); return }
         guard selected?.asset?.isPair == true else { return }
         selection.toggleRAW(); viewport = ViewportState(); loadPreview()
     }
     private func loadPreview() {
+        guard editor == nil else { return }
         if let comparison {
             previewTask?.cancel(); prefetchTask?.cancel(); preview = nil; previewLoading = false; previewError = nil
             if !busy { comparison.resume() }; return
@@ -406,14 +431,16 @@ import PhotoCore
         guard let asset = selected?.asset else { return }
         let resource = selection.showsRAW ? (asset.raw ?? asset.preferred) : asset.preferred
         let revision = selection.revision
+        let request = UUID(); previewRequest = request
+        let edit = edits[asset.id] ?? .identity
         previewLoading = true
         previewTask = Task {
             do {
-                let image = try await ImageService.shared.image(resource, maxPixel: nil)
-                guard !Task.isCancelled, selection.accepts(revision) else { return }
+                let image = try await ImageService.shared.image(resource, maxPixel: nil, edit: edit)
+                guard !Task.isCancelled, selection.accepts(revision), previewRequest == request, editor == nil else { return }
                 preview = image; previewLoading = false
             } catch {
-                guard !Task.isCancelled, selection.accepts(revision) else { return }
+                guard !Task.isCancelled, selection.accepts(revision), previewRequest == request, editor == nil else { return }
                 previewError = error.localizedDescription; previewLoading = false
             }
         }
@@ -426,6 +453,82 @@ import PhotoCore
             }
         }
     }
+
+    var canEdit: Bool { !interactionLocked && (comparison?.activePane.asset ?? selected?.asset) != nil }
+    var activeEdit: PhotoEdit { selected.flatMap { edits[$0.id] } ?? .identity }
+    var resultingSize: CGSize? {
+        guard !activeEdit.isIdentity, let image = comparison?.activePane.image ?? preview else { return nil }
+        return CGSize(width: image.cgImage.width, height: image.cgImage.height)
+    }
+    func edit(for asset: PhotoAsset) -> PhotoEdit { edits[asset.id] ?? .identity }
+    private func store(for location: Location) -> PhotoEditStore {
+        if let existing = editStores[location] { return existing }
+        let created = editStoreFactory(location); editStores[location] = created; return created
+    }
+    private func loadEdits(for contents: [CatalogEntry], location: Location, valid: () -> Bool) async {
+        let store = store(for: location)
+        var loaded: [String: PhotoEdit] = [:], warnings: [String: String] = [:]
+        for asset in contents.compactMap(\.asset) {
+            do {
+                let result = try await store.recipe(for: asset)
+                loaded[asset.id] = result.edit
+                if let warning = result.warning { warnings[asset.id] = warning }
+            } catch { loaded[asset.id] = .identity; warnings[asset.id] = error.localizedDescription }
+        }
+        guard valid() else { return }
+        edits.merge(loaded) { _, new in new }; editWarnings.merge(warnings) { _, new in new }
+        for asset in contents.compactMap(\.asset) where warnings[asset.id] == nil { editWarnings[asset.id] = nil }
+        editRevision += 1
+    }
+    func startEditing() {
+        guard canEdit, let asset = comparison?.activePane.asset ?? selected?.asset else { return }
+        if comparison != nil { endComparison() }
+        if mode != .gallery { priorMode = mode; mode = .gallery }
+        folderRevision += 1; previewRequest = UUID(); deferredReload = loading
+        loading = false; cancelColumnTasks()
+        previewTask?.cancel(); prefetchTask?.cancel()
+        let store = location.map { self.store(for: $0) } ?? PhotoEditStore(folder: asset.preferred.url.deletingLastPathComponent())
+        let session = EditorSession(asset: asset, showsRAW: selection.showsRAW, initial: edits[asset.id] ?? .identity, store: store)
+        editor = session; session.start()
+    }
+    @discardableResult func finishEditing(save: Bool) async -> Bool {
+        guard let session = editor, !session.saving else { return false }
+        if save {
+            guard await session.save(), editor === session else { return false }
+            edits[session.asset.id] = session.draft; editWarnings[session.asset.id] = nil; editRevision += 1
+        } else { session.cancel() }
+        guard editor === session else { return false }
+        if selection.showsRAW != session.showsRAW { selection.toggleRAW() }
+        editor = nil; viewport = ViewportState(); loadPreview()
+        if deferredReload { deferredReload = false; reload() }
+        return true
+    }
+    enum EditorCloseChoice { case save, discard, cancel }
+    func requestClose(choice: EditorCloseChoice? = nil, _ completion: @escaping @MainActor (Bool) -> Void) {
+        guard let editor else { completion(true); return }
+        guard !editor.saving else { completion(false); return }
+        if !editor.dirty { Task { completion(await finishEditing(save: false)) }; return }
+        let decision: EditorCloseChoice
+        if let choice { decision = choice }
+        else {
+            let alert = NSAlert(); alert.messageText = "Сохранить правки снимка?"
+            alert.informativeText = "Оригинальные файлы не изменяются."
+            alert.addButton(withTitle: "Сохранить").toolTip = "Сохранить правки и продолжить закрытие"
+            alert.addButton(withTitle: "Отбросить").toolTip = "Продолжить закрытие без сохранения правок"
+            alert.addButton(withTitle: "Отмена").toolTip = "Вернуться к редактированию"
+            switch alert.runModal() {
+            case .alertFirstButtonReturn: decision = .save
+            case .alertSecondButtonReturn: decision = .discard
+            default: decision = .cancel
+            }
+        }
+        switch decision {
+        case .save: Task { completion(await finishEditing(save: true)) }
+        case .discard: Task { completion(await finishEditing(save: false)) }
+        case .cancel: completion(false)
+        }
+    }
+
 }
 
 struct ViewportState: Equatable {
@@ -507,18 +610,20 @@ extension BrowserModel {
         }
     }
     private func loadColumn(_ id: String, nearest: Int? = nil) {
-        guard !busy, let index = columns.firstIndex(where: { $0.id == id }) else { return }
+        guard !interactionLocked, let index = columns.firstIndex(where: { $0.id == id }) else { return }
         columnTasks[id]?.cancel()
         let request = UUID(), url = columns[index].url, source = catalog
         columns[index].request = request; columns[index].loading = true; columns[index].error = nil
         if url.path == folder?.path { loading = true; error = nil }
         columnTasks[id] = Task { [weak self] in
             let result = await Task.detached { Result { try Self.directoryContents(source, of: url) } }.value
-            guard !Task.isCancelled, let self, !busy,
+            guard !Task.isCancelled, let self, !interactionLocked,
                   let index = columns.firstIndex(where: { $0.id == id && $0.request == request }) else { return }
             columns[index].loading = false
             switch result {
             case .success(let contents):
+                await loadEdits(for: contents, location: .folder(url), valid: { self.editor == nil && self.columns.contains { $0.id == id && $0.request == request } })
+                guard editor == nil, columns.indices.contains(index), columns[index].request == request else { return }
                 let priorEntries = columns[index].entries
                 columns[index].entries = FolderCatalog.sorted(contents, by: sort, ascending: ascending)
                 if let highlighted = columns[index].highlightedID,
@@ -565,18 +670,18 @@ extension BrowserModel {
         closeColumns(after: index)
     }
     func selectAllColumnPhotos(_ id: String) {
-        guard !busy else { return }
+        guard !interactionLocked else { return }
         if let index = columns.firstIndex(where: { $0.id == id }) {
             useColumn(index); selectAllPhotos(); columns[index].highlightedID = selection.id
         } else { selectAllPhotos() }
     }
     func focusColumn(_ id: String) {
-        guard !busy, visibleColumns.contains(where: { $0.id == id }) else { return }
+        guard !interactionLocked, visibleColumns.contains(where: { $0.id == id }) else { return }
         activeColumnID = id
     }
     func clickColumn(_ id: String, entryID: String?, command: Bool = false, shift: Bool = false,
                      doubleClick: Bool = false, restoring group: Set<String>? = nil) {
-        guard !busy else { return }
+        guard !interactionLocked else { return }
         guard let index = columns.firstIndex(where: { $0.id == id }), !isLibrary else {
             // The managed library is a single flat catalog, with the same row behavior.
             if doubleClick, let entry = entries.first(where: { $0.id == entryID }), !entry.isFolder {
@@ -619,7 +724,7 @@ extension BrowserModel {
     }
     /// Return false for keys belonging to text, system commands or another view.
     @discardableResult func columnKey(_ code: UInt16, shift: Bool = false) -> Bool {
-        guard !busy, mode == .columns else { return false }
+        guard !interactionLocked, mode == .columns else { return false }
         let visible = visibleColumns
         guard let id = activeColumnID ?? visible.last?.id,
               let index = visible.firstIndex(where: { $0.id == id }) else { return false }
@@ -654,7 +759,7 @@ extension BrowserModel {
 }
 
 extension BrowserModel {
-    var canCompare: Bool { comparison == nil && selectedAssets.count == 2 && !busy && !loading }
+    var canCompare: Bool { comparison == nil && selectedAssets.count == 2 && !interactionLocked && !loading }
     func startComparison() {
         guard canCompare else { return }
         let assets = selectedAssets
@@ -662,7 +767,8 @@ extension BrowserModel {
         if mode != .gallery { priorMode = mode; mode = .gallery }
         previewTask?.cancel(); prefetchTask?.cancel()
         preview = nil; previewError = nil; previewLoading = false
-        comparison = ComparisonSession(assets: assets, primary: primary)
+        let recipeByURL = Dictionary(uniqueKeysWithValues: photos.compactMap(\.asset).flatMap { asset in asset.resources.map { ($0.url, edits[asset.id] ?? .identity) } })
+        comparison = ComparisonSession(assets: assets, primary: primary, recipes: recipeByURL)
         syncComparisonSelection()
     }
     func syncComparisonSelection() {
@@ -670,11 +776,11 @@ extension BrowserModel {
         selection.replace(Set(comparison.panes.map { $0.asset.id }), primary: comparison.activePane.asset.id, orderedIDs: photos.map(\.id))
     }
     func activateComparisonPane(_ index: Int) {
-        guard !busy, let comparison, comparison.panes.indices.contains(index) else { return }
+        guard !interactionLocked, let comparison, comparison.panes.indices.contains(index) else { return }
         comparison.active = index; syncComparisonSelection()
     }
     func exitComparison() {
-        guard !busy else { return }
+        guard !interactionLocked else { return }
         endComparison()
     }
     private func endComparison() {
@@ -686,12 +792,12 @@ extension BrowserModel {
         loadPreview()
     }
     func replaceComparison(with id: String) {
-        guard !busy, let session = comparison, let asset = photos.first(where: { $0.id == id })?.asset else { return }
+        guard !interactionLocked, let session = comparison, let asset = photos.first(where: { $0.id == id })?.asset else { return }
         if let index = session.panes.firstIndex(where: { $0.asset.id == id }) { activateComparisonPane(index); return }
         session.replace(session.active, with: asset); syncComparisonSelection()
     }
     func stepComparison(_ delta: Int) {
-        guard !busy, let session = comparison, let current = photos.firstIndex(where: { $0.id == session.activePane.asset.id }) else { return }
+        guard !interactionLocked, let session = comparison, let current = photos.firstIndex(where: { $0.id == session.activePane.asset.id }) else { return }
         var index = current + delta
         while photos.indices.contains(index) {
             if photos[index].id != session.panes[1 - session.active].asset.id { replaceComparison(with: photos[index].id); return }
@@ -717,6 +823,7 @@ extension BrowserModel {
     }
     func reconcileComparison() {
         guard let session = comparison else { return }
+        session.setRecipes(Dictionary(uniqueKeysWithValues: photos.compactMap(\.asset).flatMap { asset in asset.resources.map { ($0.url, edits[asset.id] ?? .identity) } }))
         for index in session.panes.indices {
             let prior = session.panes[index].asset
             // A partially trashed pair may now be identified by its remaining RAF.
@@ -738,11 +845,11 @@ extension BrowserModel {
         syncComparisonSelection()
     }
     func zoom(by factor: Double) {
-        guard !busy else { return }
+        guard !interactionLocked else { return }
         if let comparison { comparison.zoom(by: factor) } else { viewport.zoom(by: factor) }
     }
-    func fitPreview() { guard !busy else { return }; if let comparison { comparison.viewport = ViewportState() } else { viewport = ViewportState() } }
-    func actualSize() { guard !busy else { return }; if let comparison { comparison.viewport = ViewportState(scale: 1) } else { viewport = ViewportState(scale: 1) } }
+    func fitPreview() { guard !interactionLocked else { return }; if let comparison { comparison.viewport = ViewportState() } else { viewport = ViewportState() } }
+    func actualSize() { guard !interactionLocked else { return }; if let comparison { comparison.viewport = ViewportState(scale: 1) } else { viewport = ViewportState(scale: 1) } }
 }
 
 /// Value snapshot binds a confirmed trash action to its original slot and complete asset.

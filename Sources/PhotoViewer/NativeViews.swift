@@ -38,7 +38,7 @@ struct SelectionScrollRequest: Equatable {
     private var beforeClick: SelectionState?
     private var clickedID: String?
     func handle(_ id: String?, event: NSEvent, model: BrowserModel) {
-        guard !model.busy else { return }
+        guard !model.interactionLocked else { return }
         if event.clickCount == 2, let id, let entry = model.entries.first(where: { $0.id == id }) {
             if clickedID == id, let beforeClick, beforeClick.ids.contains(id) {
                 model.setSelectedIDs(beforeClick.ids, primary: id)
@@ -114,7 +114,7 @@ struct IconGrid: NSViewRepresentable {
             layout.minimumInteritemSpacing = 12; layout.minimumLineSpacing = 12
         }
         c.updating = true
-        if c.entries != model.entries { c.entries = model.entries; collection.reloadData() }
+        if c.entries != model.entries || c.editRevision != model.editRevision { c.entries = model.entries; c.editRevision = model.editRevision; collection.reloadData() }
         c.syncSelection()
         let request = SelectionScrollRequest(model)
         if c.request != request, let scroll = scroll as? SelectionScrollView {
@@ -132,6 +132,7 @@ struct IconGrid: NSViewRepresentable {
     }
     @MainActor final class Coordinator: NSObject, NSCollectionViewDataSource, NSCollectionViewDelegate {
         var model: BrowserModel
+        var editRevision = -1
         var entries: [CatalogEntry] = []
         weak var collection: NSCollectionView?
         var updating = false
@@ -141,7 +142,7 @@ struct IconGrid: NSViewRepresentable {
         func collectionView(_ collectionView: NSCollectionView, numberOfItemsInSection section: Int) -> Int { entries.count }
         func collectionView(_ collectionView: NSCollectionView, itemForRepresentedObjectAt indexPath: IndexPath) -> NSCollectionViewItem {
             let item = collectionView.makeItem(withIdentifier: .init("photo"), for: indexPath) as! PhotoItem
-            item.entry = entries[indexPath.item]; item.render(); return item
+            item.entry = entries[indexPath.item]; item.edit = item.entry?.asset.map { model.edit(for: $0) } ?? .identity; item.render(); return item
         }
         func syncSelection() {
             let wasUpdating = updating; updating = true
@@ -160,6 +161,7 @@ struct IconGrid: NSViewRepresentable {
 
 @MainActor final class PhotoItem: NSCollectionViewItem {
     var entry: CatalogEntry?
+    var edit = PhotoEdit.identity
     override var isSelected: Bool { didSet { render() } }
     override func loadView() {
         let host = NSHostingView<AnyView>(rootView: AnyView(EmptyView()))
@@ -171,7 +173,7 @@ struct IconGrid: NSViewRepresentable {
     func render() {
         guard let entry else { return }
         let content = VStack(spacing: 6) {
-            if let asset = entry.asset { Thumbnail(asset: asset) }
+            if let asset = entry.asset { Thumbnail(asset: asset, edit: edit) }
             else { Image(systemName: "folder.fill").resizable().scaledToFit().foregroundStyle(.blue).padding(20) }
             Text(entry.name).font(.caption).lineLimit(1)
             Text(entry.kind).font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
@@ -447,6 +449,7 @@ struct ColumnTable: NSViewRepresentable {
 struct ZoomCanvas: NSViewRepresentable {
     let image: CGImage
     @Binding var state: ViewportState
+    var grid = PhotoGrid.off
     @Environment(\.isEnabled) private var isEnabled
     var canInteract: (() -> Bool)? = nil
     var onActivate: (() -> Void)? = nil
@@ -454,7 +457,7 @@ struct ZoomCanvas: NSViewRepresentable {
     var onMagnify: ((Double) -> Void)? = nil
     func makeNSView(context: Context) -> CanvasView { CanvasView() }
     func updateNSView(_ view: CanvasView, context: Context) {
-        view.image = image; view.viewport = state
+        view.image = image; view.viewport = state; view.grid = grid
         view.canInteract = { isEnabled && (canInteract?() ?? true) }
         view.onChange = { state = $0 }; view.onActivate = onActivate
         view.onGeometry = onGeometry; view.onMagnify = onMagnify
@@ -464,6 +467,7 @@ struct ZoomCanvas: NSViewRepresentable {
 
 @MainActor final class CanvasView: NSView {
     var image: CGImage?
+    var grid = PhotoGrid.off
     var viewport = ViewportState()
     var canInteract: () -> Bool = { true }
     var onChange: ((ViewportState) -> Void)?
@@ -489,6 +493,7 @@ struct ZoomCanvas: NSViewRepresentable {
         let size = CGSize(width: CGFloat(image.width) * scale, height: CGFloat(image.height) * scale)
         let rect = CGRect(x: (bounds.width - size.width) / 2 + viewport.offset.width, y: (bounds.height - size.height) / 2 + viewport.offset.height, width: size.width, height: size.height)
         context.interpolationQuality = .high; context.draw(image, in: rect)
+        drawPhotoGrid(context, rect: rect, divisions: grid.divisions)
     }
     override func mouseDown(with event: NSEvent) { guard canInteract() else { lastPoint = nil; return }; onActivate?(); lastPoint = convert(event.locationInWindow, from: nil) }
     override func mouseDragged(with event: NSEvent) {

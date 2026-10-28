@@ -287,6 +287,7 @@ import PhotoCore
         f.model.clickColumn(f.root.path, entryID: try entry(f.model, f.root, "A").id)
         try await wait { source.hasStarted("A") }
         f.model.libraryRoot = libraryRoot; f.model.openLibrary()
+        #expect(f.model.loading)
         try await wait { !f.model.loading }
         source.release("A"); try await wait { source.hasFinished("A") }
         #expect(f.model.isLibrary && f.model.ancestors.isEmpty && f.model.columns.isEmpty)
@@ -308,6 +309,7 @@ import PhotoCore
         _ = try await library.importPhotos(from: f.root)
         let model = f.model
         model.libraryRoot = libraryRoot; model.openLibrary()
+        #expect(model.loading, "Opening a library publishes loading before the asynchronous scan starts")
         try await wait { !model.loading }
         let host = NSHostingView(rootView: ColumnBrowser(model: model))
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 850, height: 650), styleMask: [.titled], backing: .buffered, defer: false)

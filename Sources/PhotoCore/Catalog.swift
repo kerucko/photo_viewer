@@ -1,12 +1,22 @@
 import Foundation
+import Darwin
 
 public struct PhotoResource: Hashable, Sendable {
     public let url: URL
     public let size: Int64
     public let modified: Date
+    /// Captured with the catalog snapshot; stable across unchanged refreshes.
+    public let fileGeneration: String?
     public var isRAW: Bool { url.pathExtension.lowercased() == "raf" }
     public init(url: URL, size: Int64 = 0, modified: Date = .distantPast) {
         self.url = url; self.size = size; self.modified = modified
+        self.fileGeneration = Self.currentGeneration(at: url)
+    }
+    /// ImageService also uses a fresh generation when callers hold an old snapshot.
+    static func currentGeneration(at url: URL) -> String? {
+        var info = stat()
+        guard lstat(url.path, &info) == 0 else { return nil }
+        return "\(info.st_dev):\(info.st_ino):\(info.st_ctimespec.tv_sec):\(info.st_ctimespec.tv_nsec)"
     }
 }
 

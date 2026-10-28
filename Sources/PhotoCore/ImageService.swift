@@ -2,7 +2,10 @@ import AppKit
 import CoreImage
 import ImageIO
 
-public struct RenderedImage: @unchecked Sendable { public let cgImage: CGImage }
+public struct RenderedImage: @unchecked Sendable {
+    public let cgImage: CGImage
+    public init(cgImage: CGImage) { self.cgImage = cgImage }
+}
 enum ImageFailure: LocalizedError {
     case unreadable
     var errorDescription: String? { "Не удалось прочитать изображение. Возможно, файл повреждён или носитель отключён." }
@@ -26,9 +29,13 @@ public final class ImageService: @unchecked Sendable {
         var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
     }
 
-    public func image(_ resource: PhotoResource, maxPixel: Int?) async throws -> RenderedImage {
+    public func image(_ resource: PhotoResource, maxPixel: Int?, edit: PhotoEdit = .identity) async throws -> RenderedImage {
         try Task.checkCancellation()
-        let key = "\(resource.url.path)|\(resource.size)|\(resource.modified.timeIntervalSince1970)|\(maxPixel ?? 0)"
+        guard edit.isValid else { throw PhotoEditError.invalidRecipe }
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+        let recipeKey = try encoder.encode(edit).base64EncodedString()
+        let generation = PhotoResource.currentGeneration(at: resource.url) ?? "missing"
+        let key = "\(generation)|\(resource.url.path)|\(resource.size)|\(resource.modified.timeIntervalSince1970)|\(maxPixel ?? 0)|\(recipeKey)"
         if let cached = cache.object(forKey: key as NSString) { return RenderedImage(cgImage: cached.image) }
         let request = Request()
         return try await withTaskCancellationHandler {
@@ -36,7 +43,11 @@ public final class ImageService: @unchecked Sendable {
                 queue.addOperation { [self] in
                     guard !request.isCancelled else { continuation.resume(throwing: CancellationError()); return }
                     do {
-                        let cg = try autoreleasepool { try decode(resource, maxPixel: maxPixel) }
+                        let cg = try autoreleasepool {
+                            let decodePixel = sourceDecodeLimit(resource, maxPixel: maxPixel, edit: edit)
+                            let source = try decode(resource, maxPixel: decodePixel)
+                            return try PhotoEditRenderer.render(source, edit: edit, maxPixel: maxPixel, context: context)
+                        }
                         guard !request.isCancelled else { continuation.resume(throwing: CancellationError()); return }
                         cache.setObject(ImageBox(cg), forKey: key as NSString, cost: cg.bytesPerRow * cg.height)
                         continuation.resume(returning: RenderedImage(cgImage: cg))
@@ -50,6 +61,17 @@ public final class ImageService: @unchecked Sendable {
             // cannot publish or enter the cache after cancellation.
             request.cancel()
         }
+    }
+    private func sourceDecodeLimit(_ resource: PhotoResource, maxPixel: Int?, edit: PhotoEdit) -> Int? {
+        guard let maxPixel, !edit.isIdentity else { return maxPixel }
+        guard let source = CGImageSourceCreateWithURL(resource.url as CFURL, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
+              let height = properties[kCGImagePropertyPixelHeight] as? NSNumber else { return nil }
+        let orientation = (properties[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
+        let swapped = (5...8).contains(orientation)
+        let size = CGSize(width: swapped ? height.doubleValue : width.doubleValue, height: swapped ? width.doubleValue : height.doubleValue)
+        return PhotoEditGeometry(sourceSize: size, edit: edit).requiredSourceMaxPixel(sourceSize: size, maxPixel: maxPixel)
     }
     private func decode(_ resource: PhotoResource, maxPixel: Int?) throws -> CGImage {
         if resource.isRAW && maxPixel == nil {
