@@ -25,7 +25,9 @@ import PhotoCore
     var busy = false
     var operationTitle = ""
     var selectedAssets: [PhotoAsset] { entries.filter { selection.ids.contains($0.id) }.compactMap(\.asset) }
-    var canTrash: Bool { !selectedAssets.isEmpty && !busy && !loading }
+    var trashAssets: [PhotoAsset] { comparison.map { [$0.activePane.asset] } ?? selectedAssets }
+    var showsRAW: Bool { comparison?.activePane.showsRAW ?? selection.showsRAW }
+    var canTrash: Bool { !trashAssets.isEmpty && !busy && !loading }
     var canSelectAll: Bool { mode != .gallery && !photos.isEmpty && !busy }
     var canUp: Bool { !busy && !isLibrary && folder != nil && folder?.path != "/" }
     var entries: [CatalogEntry] = []
@@ -36,6 +38,7 @@ import PhotoCore
     var preview: RenderedImage?
     var previewError: String?
     var previewLoading = false
+    var comparison: ComparisonSession?
     var viewport = ViewportState()
     var showMetadata = UserDefaults.standard.bool(forKey: "showMetadata") {
         didSet { UserDefaults.standard.set(showMetadata, forKey: "showMetadata") }
@@ -67,14 +70,17 @@ import PhotoCore
     }
     var selected: CatalogEntry? { entries.first { $0.id == selection.id } }
     var selectedResource: PhotoResource? {
+        if let comparison { return comparison.activePane.resource }
         guard let asset = selected?.asset else { return nil }
         return selection.showsRAW ? (asset.raw ?? asset.preferred) : asset.preferred
     }
-    var canZoom: Bool { preview != nil && (mode == .gallery || mode == .columns) }
+    var canZoom: Bool { !busy && (comparison?.activePane.image != nil || preview != nil) && (mode == .gallery || mode == .columns) }
     var photos: [CatalogEntry] { entries.filter { !$0.isFolder } }
     var mode: ViewMode {
         get { selection.mode }
         set {
+            guard !busy else { return }
+            if comparison != nil { exitComparison() }
             let previous = selection.mode
             selection.mode = newValue; UserDefaults.standard.set(newValue.rawValue, forKey: "mode")
             if newValue == .columns { prepareColumns() }
@@ -106,6 +112,7 @@ import PhotoCore
         if recordHistory && location != destination {
             history = Array(history.prefix(historyIndex + 1)); history.append(destination); historyIndex = history.count - 1
         }
+        if comparison != nil { exitComparison() }
         let changed = location != destination
         location = destination
         if case .library(let root) = destination {
@@ -128,7 +135,7 @@ import PhotoCore
         }
         Task { await refresh() }
     }
-    private func refresh(nearest index: Int? = nil) async {
+    private func refresh(nearest index: Int? = nil, comparisonTrash: (ComparisonTrashSnapshot, Bool)? = nil) async {
         if mode == .columns, !isLibrary, !columns.isEmpty {
             for column in columns { loadColumn(column.id, nearest: index) }; return
         }
@@ -150,12 +157,16 @@ import PhotoCore
             catalogIssues = issues
             entries = FolderCatalog.sorted(contents, by: sort, ascending: ascending)
             loading = false
+            if let (snapshot, succeeded) = comparisonTrash {
+                completeComparisonTrash(snapshot: snapshot, succeeded: succeeded)
+            }
             reconcileSelection(nearest: index, selectFirstIfEmpty: selectFirstOnRefresh)
             selectFirstOnRefresh = false
             loadPreview()
         } catch {
             guard revision == folderRevision else { return }
-            entries = []; catalogIssues = []; select(nil); loading = false
+            if comparison != nil { endComparison() }
+            entries = []; catalogIssues = []; selection.select(nil); loading = false
             self.error = "Папка недоступна. Проверьте подключение носителя и права доступа.\n\(error.localizedDescription)"
         }
     }
@@ -207,10 +218,12 @@ import PhotoCore
     func confirmTrash() {
         guard canTrash, location != nil else { return }
         // Capture the complete group before confirmation or asynchronous work.
-        let assets = selectedAssets
+        let assets = trashAssets
+        let comparisonSnapshot = comparison.map { ComparisonTrashSnapshot(session: $0, photoIDs: photos.map(\.id)) }
         let alert = Self.trashConfirmation(for: assets)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let index = photos.firstIndex { $0.id == selection.id } ?? 0
+        let targetID = comparisonSnapshot?.asset.id ?? selection.id
+        let index = photos.firstIndex { $0.id == targetID } ?? 0
         let managedRoot: URL?
         if case .library(let root)? = location { managedRoot = root } else { managedRoot = libraryRoot }
         let target = managedRoot.map { root in library?.root == root ? library! : PhotoLibrary(root: root) }
@@ -222,8 +235,14 @@ import PhotoCore
                 }
                 return await Task.detached { PhotoTrash.trash(asset) }.value
             }
-            finishOperation(resumeColumns: false)
-            await refresh(nearest: index)
+            if let comparisonSnapshot {
+                // Keep native gestures and user actions locked through catalog reconciliation.
+                await refresh(nearest: index, comparisonTrash: (comparisonSnapshot, report.failures.isEmpty))
+                finishOperation(resumeColumns: false)
+            } else {
+                finishOperation(resumeColumns: false)
+                await refresh(nearest: index)
+            }
             if !report.failures.isEmpty {
                 showMessage("Не все файлы перемещены в Корзину", "Перемещено: \(report.trashed.count).\n" + Self.summarizeIssues(report.failures))
             }
@@ -258,6 +277,7 @@ import PhotoCore
             columns[index].request = nil; columns[index].loading = false
         }
         previewTask?.cancel(); prefetchTask?.cancel()
+        comparison?.cancel()
     }
     private func finishOperation(resumeColumns: Bool = true) {
         busy = false
@@ -296,10 +316,12 @@ import PhotoCore
     }
     func select(_ id: String?) {
         guard !busy else { return }
+        if comparison != nil { if let id { replaceComparison(with: id) }; return }
         selectFirstOnRefresh = false
         changeSelection { $0.select(id) }
     }
     func selectGesture(_ id: String?, command: Bool = false, shift: Bool = false) {
+        if comparison != nil { if let id { replaceComparison(with: id) }; return }
         guard let id, let entry = entries.first(where: { $0.id == id }) else { select(nil); return }
         let order = photos.map(\.id)
         changeSelection { selection in
@@ -333,6 +355,7 @@ import PhotoCore
         changeSelection { $0.replace(Set(ids), primary: $0.id, orderedIDs: ids) }
     }
     func reconcileSelection(nearest index: Int? = nil, selectFirstIfEmpty: Bool = false) {
+        if comparison != nil { reconcileComparison(); return }
         let hadSelection = !selection.ids.isEmpty
         let prior = selection.id
         selection.retain(orderedIDs: entries.map(\.id))
@@ -343,6 +366,7 @@ import PhotoCore
     }
     func activate(_ entry: CatalogEntry) {
         guard !busy else { return }
+        if comparison != nil, !entry.isFolder { replaceComparison(with: entry.id); return }
         if entry.isFolder { open(entry.url) }
         else {
             changeSelection { $0.focus(entry.id) }
@@ -352,10 +376,12 @@ import PhotoCore
     }
     func toggleGallery() {
         guard !busy else { return }
+        if comparison != nil { exitComparison() }
         if mode == .gallery { mode = priorMode }
         else if selected?.asset != nil { priorMode = mode; mode = .gallery }
     }
     func step(_ delta: Int) {
+        if comparison != nil { stepComparison(delta); return }
         guard !photos.isEmpty else { return }
         let current = photos.firstIndex { $0.id == selection.id } ?? (delta > 0 ? -1 : photos.count)
         select(photos[min(max(current + delta, 0), photos.count - 1)].id)
@@ -367,10 +393,15 @@ import PhotoCore
     }
     func toggleRAW() {
         guard !busy else { return }
+        if let comparison { comparison.toggleRAW(); syncComparisonSelection(); return }
         guard selected?.asset?.isPair == true else { return }
         selection.toggleRAW(); viewport = ViewportState(); loadPreview()
     }
     private func loadPreview() {
+        if let comparison {
+            previewTask?.cancel(); prefetchTask?.cancel(); preview = nil; previewLoading = false; previewError = nil
+            if !busy { comparison.resume() }; return
+        }
         previewTask?.cancel(); prefetchTask?.cancel(); preview = nil; previewError = nil; previewLoading = false
         guard let asset = selected?.asset else { return }
         let resource = selection.showsRAW ? (asset.raw ?? asset.preferred) : asset.preferred
@@ -619,5 +650,111 @@ extension BrowserModel {
         default: return false
         }
         return true
+    }
+}
+
+extension BrowserModel {
+    var canCompare: Bool { comparison == nil && selectedAssets.count == 2 && !busy && !loading }
+    func startComparison() {
+        guard canCompare else { return }
+        let assets = selectedAssets
+        let primary = selection.id
+        if mode != .gallery { priorMode = mode; mode = .gallery }
+        previewTask?.cancel(); prefetchTask?.cancel()
+        preview = nil; previewError = nil; previewLoading = false
+        comparison = ComparisonSession(assets: assets, primary: primary)
+        syncComparisonSelection()
+    }
+    func syncComparisonSelection() {
+        guard let comparison else { return }
+        selection.replace(Set(comparison.panes.map { $0.asset.id }), primary: comparison.activePane.asset.id, orderedIDs: photos.map(\.id))
+    }
+    func activateComparisonPane(_ index: Int) {
+        guard !busy, let comparison, comparison.panes.indices.contains(index) else { return }
+        comparison.active = index; syncComparisonSelection()
+    }
+    func exitComparison() {
+        guard !busy else { return }
+        endComparison()
+    }
+    private func endComparison() {
+        guard let session = comparison else { return }
+        session.cancel(); comparison = nil
+        viewport = session.viewport
+        selection.replace(Set(session.panes.map { $0.asset.id }), primary: session.activePane.asset.id, orderedIDs: photos.map(\.id))
+        if selection.showsRAW != session.activePane.showsRAW { selection.toggleRAW() }
+        loadPreview()
+    }
+    func replaceComparison(with id: String) {
+        guard !busy, let session = comparison, let asset = photos.first(where: { $0.id == id })?.asset else { return }
+        if let index = session.panes.firstIndex(where: { $0.asset.id == id }) { activateComparisonPane(index); return }
+        session.replace(session.active, with: asset); syncComparisonSelection()
+    }
+    func stepComparison(_ delta: Int) {
+        guard !busy, let session = comparison, let current = photos.firstIndex(where: { $0.id == session.activePane.asset.id }) else { return }
+        var index = current + delta
+        while photos.indices.contains(index) {
+            if photos[index].id != session.panes[1 - session.active].asset.id { replaceComparison(with: photos[index].id); return }
+            index += delta
+        }
+    }
+    func completeComparisonTrash(snapshot: ComparisonTrashSnapshot, succeeded: Bool) {
+        let session = snapshot.session
+        guard succeeded, comparison === session else { return }
+        let slot = snapshot.slot
+        // Never apply a completion to a replacement that no longer represents the confirmed asset.
+        guard session.panes[slot].asset == snapshot.asset else { return }
+        let other = session.panes[1 - slot].asset.id
+        let index = snapshot.photoIDs.firstIndex(of: snapshot.asset.id) ?? 0
+        let candidates = Array(snapshot.photoIDs.dropFirst(index + 1)) + Array(snapshot.photoIDs.prefix(index).reversed())
+        if let replacement = candidates.first(where: { candidate in candidate != other && photos.contains { $0.id == candidate } }),
+           let asset = entries.first(where: { $0.id == replacement })?.asset {
+            session.replace(slot, with: asset); syncComparisonSelection()
+        } else {
+            session.active = 1 - slot; endComparison()
+            selection.select(other)
+        }
+    }
+    func reconcileComparison() {
+        guard let session = comparison else { return }
+        for index in session.panes.indices {
+            let prior = session.panes[index].asset
+            // A partially trashed pair may now be identified by its remaining RAF.
+            let urls = Set(prior.resources.map(\.url))
+            guard let asset = photos.compactMap(\.asset).first(where: { $0.id == prior.id || $0.resources.contains { urls.contains($0.url) } }) else {
+                let survivorIndex = 1 - index
+                let survivorURLs = Set(session.panes[survivorIndex].asset.resources.map(\.url))
+                let survivor = photos.compactMap(\.asset).first { asset in
+                    asset.resources.contains { survivorURLs.contains($0.url) }
+                }
+                if let survivor { session.update(survivorIndex, asset: survivor) }
+                session.active = survivorIndex; endComparison()
+                if let survivor { selection.select(survivor.id) }
+                else { selection.retain(orderedIDs: photos.map(\.id)) }
+                return
+            }
+            session.update(index, asset: asset)
+        }
+        syncComparisonSelection()
+    }
+    func zoom(by factor: Double) {
+        guard !busy else { return }
+        if let comparison { comparison.zoom(by: factor) } else { viewport.zoom(by: factor) }
+    }
+    func fitPreview() { guard !busy else { return }; if let comparison { comparison.viewport = ViewportState() } else { viewport = ViewportState() } }
+    func actualSize() { guard !busy else { return }; if let comparison { comparison.viewport = ViewportState(scale: 1) } else { viewport = ViewportState(scale: 1) } }
+}
+
+/// Value snapshot binds a confirmed trash action to its original slot and complete asset.
+@MainActor struct ComparisonTrashSnapshot {
+    let session: ComparisonSession
+    let slot: Int
+    let asset: PhotoAsset
+    let photoIDs: [String]
+    init(session: ComparisonSession, slot: Int? = nil, photoIDs: [String]) {
+        self.session = session
+        self.slot = slot ?? session.active
+        self.asset = session.panes[self.slot].asset
+        self.photoIDs = photoIDs
     }
 }

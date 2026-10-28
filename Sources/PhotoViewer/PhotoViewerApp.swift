@@ -13,13 +13,15 @@ import PhotoCore
         .defaultSize(width: 1180, height: 780)
         .commands {
             CommandMenu("Вид") {
-                Button("Увеличить") { model.viewport.zoom(by: 1.4) }
+                Button("Сравнить выбранные") { model.startComparison() }.disabled(!model.canCompare)
+                Divider()
+                Button("Увеличить") { model.zoom(by: 1.4) }
                     .keyboardShortcut("=", modifiers: .command).disabled(!model.canZoom)
-                Button("Уменьшить") { model.viewport.zoom(by: 1 / 1.4) }
+                Button("Уменьшить") { model.zoom(by: 1 / 1.4) }
                     .keyboardShortcut("-", modifiers: .command).disabled(!model.canZoom)
-                Button("Вписать в окно") { model.viewport = ViewportState() }
+                Button("Вписать в окно") { model.fitPreview() }
                     .keyboardShortcut("0", modifiers: .command).disabled(!model.canZoom)
-                Button("Реальный размер (100%)") { model.viewport = ViewportState(scale: 1) }
+                Button("Реальный размер (100%)") { model.actualSize() }
                     .keyboardShortcut("1", modifiers: .command).disabled(!model.canZoom)
                 Divider()
                 Toggle("Показать сведения", isOn: $model.showMetadata)
@@ -37,7 +39,7 @@ import PhotoCore
                 Button("Импортировать с SD…") { model.chooseImport() }.disabled(model.busy)
                 Button("Создать ZIP-архив…") { model.createZIP() }.disabled(!model.canExportZIP)
                 Divider()
-                Button("Переместить выбранные снимки в Корзину…") { model.confirmTrash() }
+                Button(model.comparison == nil ? "Переместить выбранные снимки в Корзину…" : "Переместить активный снимок в Корзину…") { model.confirmTrash() }
                     .keyboardShortcut(.delete, modifiers: .command).disabled(!model.canTrash)
                 Button("Обновить") { model.reload() }.keyboardShortcut("r").disabled(model.busy)
             }
@@ -147,6 +149,10 @@ struct NavigationToolbarView: View {
             model.selectAllPhotos(); return true
         }
         guard modifiers.isEmpty else { return false }
+        if model.comparison != nil {
+            if event.keyCode == 48 { model.activateComparisonPane(1 - model.comparison!.active); return true }
+            if event.keyCode == 53 { model.exitComparison(); return true }
+        }
         switch event.keyCode {
         case 123: model.step(-1); return true
         case 124: model.step(1); return true
@@ -220,8 +226,8 @@ struct BrowserView: View {
                     Text(model.selected?.name ?? "Нет выделения").lineLimit(1)
                     Spacer()
                     if model.selected?.asset?.isPair == true {
-                        Button(model.selection.showsRAW ? "RAW → JPG" : "JPG → RAW") { model.toggleRAW() }
-                            .help(model.selection.showsRAW ? "Показать JPEG" : "Показать проявленный RAW")
+                        Button(model.showsRAW ? "RAW → JPG" : "JPG → RAW") { model.toggleRAW() }
+                            .help(model.showsRAW ? "Показать JPEG" : "Показать проявленный RAW")
                     } else if let asset = model.selected?.asset { Text(asset.kind).foregroundStyle(.secondary) }
                 }.font(.callout).padding(10)
             }
@@ -243,6 +249,17 @@ struct BrowserView: View {
                 }
                 ToolbarSpacer(.fixed)
             }
+            if model.mode != .gallery {
+                ToolbarItem {
+                    if model.comparison != nil {
+                        Button("Завершить сравнение", systemImage: "xmark.rectangle") { model.exitComparison() }
+                            .disabled(model.busy).help("Вернуться к активному снимку в галерее (Esc)")
+                    } else {
+                        Button("Сравнить выбранные", systemImage: "rectangle.split.2x1") { model.startComparison() }
+                            .disabled(!model.canCompare).help("Сравнить два выбранных снимка")
+                    }
+                }
+            }
             ToolbarItem(placement: .principal) {
                 if compactToolbar {
                     Menu {
@@ -256,21 +273,16 @@ struct BrowserView: View {
             }
             if model.mode == .gallery {
                 ToolbarItem {
-                    if model.selected?.asset?.isPair == true {
-                        Button(model.selection.showsRAW ? "RAW → JPG" : "JPG → RAW") { model.toggleRAW() }
-                            .disabled(model.busy).help(model.selection.showsRAW ? "Показать JPEG" : "Показать проявленный RAW")
-                    } else if let asset = model.selected?.asset {
-                        Text(asset.kind).foregroundStyle(.secondary)
-                    }
-                }
+                    GalleryActionsToolbarView(model: model)
+                }.sharedBackgroundVisibility(.hidden)
                 if compactToolbar {
                     ToolbarItem {
                         Menu {
-                            Button("Вписать в окно") { model.viewport = ViewportState() }
-                            Button("Реальный размер (100%)") { model.viewport = ViewportState(scale: 1) }
+                            Button("Вписать в окно") { model.fitPreview() }
+                            Button("Реальный размер (100%)") { model.actualSize() }
                             Divider()
-                            Button("Уменьшить") { model.viewport.zoom(by: 1 / 1.4) }
-                            Button("Увеличить") { model.viewport.zoom(by: 1.4) }
+                            Button("Уменьшить") { model.zoom(by: 1 / 1.4) }
+                            Button("Увеличить") { model.zoom(by: 1.4) }
                         } label: {
                             Label("Масштаб", systemImage: "magnifyingglass")
                         }
@@ -279,16 +291,16 @@ struct BrowserView: View {
                     }
                 } else {
                     ToolbarItemGroup {
-                        Button("Вписать") { model.viewport = ViewportState() }
+                        Button("Вписать") { model.fitPreview() }
                             .disabled(model.busy || !model.canZoom)
                             .help("Вписать в окно (⌘0)")
-                        Button("100%") { model.viewport = ViewportState(scale: 1) }
+                        Button("100%") { model.actualSize() }
                             .disabled(model.busy || !model.canZoom)
                             .help("Реальный размер — 100% (⌘1)")
-                        Button { model.viewport.zoom(by: 1 / 1.4) } label: {
+                        Button { model.zoom(by: 1 / 1.4) } label: {
                             Label("Уменьшить", systemImage: "minus.magnifyingglass")
                         }.disabled(model.busy || !model.canZoom).help("Уменьшить (⌘−)")
-                        Button { model.viewport.zoom(by: 1.4) } label: {
+                        Button { model.zoom(by: 1.4) } label: {
                             Label("Увеличить", systemImage: "plus.magnifyingglass")
                         }.disabled(model.busy || !model.canZoom).help("Увеличить (⌘=)")
                     }
@@ -310,8 +322,8 @@ struct BrowserView: View {
                 .help("Выбрать порядок сортировки")
             }
             ToolbarItem {
-                Button(action: model.confirmTrash) { Label("В Корзину", systemImage: "trash") }
-                    .disabled(model.busy || !model.canTrash).help("Переместить все файлы выбранных снимков в Корзину (⌘⌫)")
+                Button(action: model.confirmTrash) { Label(model.comparison == nil ? "В Корзину" : "Активный снимок в Корзину", systemImage: "trash") }
+                    .disabled(model.busy || !model.canTrash).help(model.comparison == nil ? "Переместить все файлы выбранных снимков в Корзину (⌘⌫)" : "Переместить все файлы только активного снимка в Корзину (⌘⌫)")
             }
             ToolbarItem {
                 Button(action: model.reload) { Label("Обновить", systemImage: "arrow.clockwise") }.disabled(model.busy).help("Обновить (⌘R)")
@@ -358,24 +370,53 @@ struct Thumbnail: View {
     }
 }
 
+/// Own the gap and inset so macOS cannot merge away spacing between these actions.
+struct GalleryActionsToolbarView: View {
+    @Bindable var model: BrowserModel
+    var body: some View {
+        HStack(spacing: 12) {
+            if model.comparison != nil {
+                Button("Завершить сравнение", systemImage: "xmark.rectangle") { model.exitComparison() }
+                    .labelStyle(.iconOnly)
+                    .disabled(model.busy).help("Вернуться к активному снимку в галерее (Esc)")
+            } else {
+                Button("Сравнить выбранные", systemImage: "rectangle.split.2x1") { model.startComparison() }
+                    .labelStyle(.iconOnly)
+                    .disabled(!model.canCompare).help("Сравнить два выбранных снимка")
+            }
+            if model.selected?.asset?.isPair == true {
+                Button(model.showsRAW ? "RAW → JPG" : "JPG → RAW") { model.toggleRAW() }
+                    .disabled(model.busy).help(model.showsRAW ? "Показать JPEG" : "Показать проявленный RAW")
+            } else if let asset = model.selected?.asset {
+                Text(asset.kind).foregroundStyle(.secondary)
+            }
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 10)
+        .frame(height: 34)
+        .background(.regularMaterial, in: Capsule())
+        .fixedSize(horizontal: true, vertical: false)
+    }
+}
+
 struct GalleryView: View {
     @Bindable var model: BrowserModel
     var body: some View {
         VStack(spacing: 0) {
-            PreviewPane(model: model)
+            if let session = model.comparison { ComparisonView(model: model, session: session) }
+            else { PreviewPane(model: model) }
             Divider()
             ScrollViewReader { proxy in
                 ScrollView(.horizontal) {
                     LazyHStack(spacing: 10) {
-                        ForEach(model.entries) { entry in
+                        ForEach(model.comparison == nil ? model.entries : model.photos) { entry in
                             VStack(spacing: 4) {
                                 if let asset = entry.asset { Thumbnail(asset: asset).frame(width: model.filmstripSize.width, height: model.filmstripSize.imageHeight) }
                                 else { Image(systemName: "folder.fill").font(.largeTitle).frame(width: model.filmstripSize.width, height: model.filmstripSize.imageHeight) }
                                 Text(entry.name).font(.caption).lineLimit(1).frame(width: model.filmstripSize.width)
-                            }.padding(5).background(model.selection.id == entry.id ? Color.accentColor.opacity(0.25) : .clear, in: RoundedRectangle(cornerRadius: 8))
+                            }.padding(5).background(model.selection.ids.contains(entry.id) ? Color.accentColor.opacity(model.selection.id == entry.id ? 0.35 : 0.15) : .clear, in: RoundedRectangle(cornerRadius: 8))
                                 .id(entry.id)
-                                .onTapGesture(count: 2) { model.activate(entry) }
-                                .onTapGesture { model.select(entry.id) }
+                                .overlay { GalleryThumbnailClickTarget(model: model, entryID: entry.id) }
                         }
                     }.padding(10)
                 }.frame(height: model.filmstripSize.stripHeight)

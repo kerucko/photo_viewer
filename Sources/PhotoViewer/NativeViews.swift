@@ -447,17 +447,32 @@ struct ColumnTable: NSViewRepresentable {
 struct ZoomCanvas: NSViewRepresentable {
     let image: CGImage
     @Binding var state: ViewportState
+    @Environment(\.isEnabled) private var isEnabled
+    var canInteract: (() -> Bool)? = nil
+    var onActivate: (() -> Void)? = nil
+    var onGeometry: ((CGSize, CGFloat) -> Void)? = nil
+    var onMagnify: ((Double) -> Void)? = nil
     func makeNSView(context: Context) -> CanvasView { CanvasView() }
     func updateNSView(_ view: CanvasView, context: Context) {
         view.image = image; view.viewport = state
-        view.onChange = { state = $0 }; view.needsDisplay = true
+        view.canInteract = { isEnabled && (canInteract?() ?? true) }
+        view.onChange = { state = $0 }; view.onActivate = onActivate
+        view.onGeometry = onGeometry; view.onMagnify = onMagnify
+        view.reportGeometry(); view.needsDisplay = true
     }
 }
 
 @MainActor final class CanvasView: NSView {
     var image: CGImage?
     var viewport = ViewportState()
+    var canInteract: () -> Bool = { true }
     var onChange: ((ViewportState) -> Void)?
+    var onActivate: (() -> Void)?
+    var onGeometry: ((CGSize, CGFloat) -> Void)?
+    var onMagnify: ((Double) -> Void)?
+    func reportGeometry() { onGeometry?(bounds.size, window?.backingScaleFactor ?? 2) }
+    override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); reportGeometry() }
+    override func viewDidChangeBackingProperties() { super.viewDidChangeBackingProperties(); reportGeometry() }
     private var lastPoint: NSPoint?
     override var acceptsFirstResponder: Bool { true }
     override var wantsDefaultClipping: Bool { true }
@@ -475,18 +490,64 @@ struct ZoomCanvas: NSViewRepresentable {
         let rect = CGRect(x: (bounds.width - size.width) / 2 + viewport.offset.width, y: (bounds.height - size.height) / 2 + viewport.offset.height, width: size.width, height: size.height)
         context.interpolationQuality = .high; context.draw(image, in: rect)
     }
-    override func mouseDown(with event: NSEvent) { lastPoint = convert(event.locationInWindow, from: nil) }
+    override func mouseDown(with event: NSEvent) { guard canInteract() else { lastPoint = nil; return }; onActivate?(); lastPoint = convert(event.locationInWindow, from: nil) }
     override func mouseDragged(with event: NSEvent) {
+        guard canInteract() else { lastPoint = nil; return }
         let point = convert(event.locationInWindow, from: nil)
         if let lastPoint { viewport.offset.width -= point.x - lastPoint.x; viewport.offset.height -= point.y - lastPoint.y; publish() }
         lastPoint = point
     }
     override func mouseUp(with event: NSEvent) { lastPoint = nil }
-    override func scrollWheel(with event: NSEvent) { viewport.offset.width += event.scrollingDeltaX; viewport.offset.height -= event.scrollingDeltaY; publish() }
+    override func scrollWheel(with event: NSEvent) { guard canInteract() else { return }; onActivate?(); viewport.offset.width += event.scrollingDeltaX; viewport.offset.height -= event.scrollingDeltaY; publish() }
     override func magnify(with event: NSEvent) {
+        guard canInteract() else { return }
+        if let onMagnify { onMagnify(1 + event.magnification); return }
         viewport.scale = min(8, max(0.05, (viewport.scale ?? fit * viewport.fitMultiplier * (window?.backingScaleFactor ?? 2)) * (1 + event.magnification)))
         publish()
     }
     private func publish() { onChange?(viewport); needsDisplay = true }
-    override func setFrameSize(_ newSize: NSSize) { super.setFrameSize(newSize); needsDisplay = true }
+    override func setFrameSize(_ newSize: NSSize) { super.setFrameSize(newSize); reportGeometry(); needsDisplay = true }
+}
+
+/// Capture modifiers at native mouseDown, before SwiftUI can defer gesture delivery.
+struct GalleryThumbnailClickTarget: NSViewRepresentable {
+    let model: BrowserModel
+    let entryID: String
+    func makeNSView(context: Context) -> GalleryThumbnailClickView { GalleryThumbnailClickView() }
+    func updateNSView(_ view: GalleryThumbnailClickView, context: Context) {
+        view.model = model; view.entryID = entryID
+        view.setAccessibilityLabel(model.entries.first { $0.id == entryID }?.name)
+        view.setAccessibilityValue(model.selection.ids.contains(entryID) ? "Выбрано" : "")
+    }
+}
+
+@MainActor final class GalleryThumbnailClickView: NSView {
+    weak var model: BrowserModel?
+    var entryID = ""
+    private var beforeClick: SelectionState?
+    private var clickedID: String?
+    override var acceptsFirstResponder: Bool { true }
+    override func isAccessibilityElement() -> Bool { true }
+    override func accessibilityRole() -> NSAccessibility.Role? { .button }
+    override func accessibilityPerformPress() -> Bool {
+        guard let model, !model.busy else { return false }
+        model.selectGesture(entryID); return true
+    }
+    override func mouseDown(with event: NSEvent) {
+        guard let model, !model.busy,
+              let entry = model.entries.first(where: { $0.id == entryID }) else { return }
+        window?.makeFirstResponder(self)
+        if model.comparison != nil {
+            model.selectGesture(entryID); return
+        }
+        if event.clickCount == 2 {
+            if clickedID == entryID, let beforeClick, beforeClick.ids.contains(entryID), !entry.isFolder {
+                model.setSelectedIDs(beforeClick.ids, primary: entryID)
+            }
+            model.activate(entry)
+        } else {
+            beforeClick = model.selection; clickedID = entryID
+            model.selectGesture(entryID, command: event.modifierFlags.contains(.command))
+        }
+    }
 }
