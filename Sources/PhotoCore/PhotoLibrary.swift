@@ -83,6 +83,50 @@ private enum LibraryFiles {
     }
 }
 
+// Nanosecond timestamps avoid Date rounding and URL resource-value caching.
+struct LibraryImportDates: Sendable, Equatable {
+    let creationSeconds: Int
+    let creationNanoseconds: Int
+    let modificationSeconds: Int
+    let modificationNanoseconds: Int
+
+    init(_ url: URL) throws {
+        var info = stat()
+        guard lstat(url.path, &info) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        creationSeconds = info.st_birthtimespec.tv_sec
+        creationNanoseconds = info.st_birthtimespec.tv_nsec
+        modificationSeconds = info.st_mtimespec.tv_sec
+        modificationNanoseconds = info.st_mtimespec.tv_nsec
+    }
+
+    func restore(to url: URL) throws {
+        var attributes = attrlist()
+        attributes.bitmapcount = UInt16(ATTR_BIT_MAP_COUNT)
+        attributes.commonattr = attrgroup_t(ATTR_CMN_CRTIME | ATTR_CMN_MODTIME)
+        // setattrlist consumes values in attribute-bit order: creation, modification.
+        var times = [timespec(tv_sec: creationSeconds, tv_nsec: creationNanoseconds),
+                     timespec(tv_sec: modificationSeconds, tv_nsec: modificationNanoseconds)]
+        let result = times.withUnsafeMutableBytes {
+            setattrlist(url.path, &attributes, $0.baseAddress, $0.count, UInt32(FSOPT_NOFOLLOW))
+        }
+        guard result == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+    }
+}
+
+// Mutation hooks receive only staged copies; attribute reads inspect either side.
+struct LibraryImportHooks: Sendable {
+    var restoreDates: @Sendable (LibraryImportDates, URL) throws -> Void = { try $0.restore(to: $1) }
+    var beforeVerification: @Sendable (URL) throws -> Void = { _ in }
+    var readAttributes: @Sendable (URL) throws -> [String: Data] = { try LibraryFiles.xattrs($0) }
+
+    func attributes(_ url: URL) throws -> [String: Data] {
+        // macOS provenance describes the local copy, not the original photograph.
+        try readAttributes(url).filter { $0.key != "com.apple.provenance" }
+    }
+}
+
 /// Managed originals are never overwritten. The manifest is also the future sync journal.
 public actor PhotoLibrary {
     public nonisolated let root: URL
@@ -157,6 +201,9 @@ public actor PhotoLibrary {
                          relativePaths: chosen.map { String($0.stored.dropFirst("Originals/".count)) }, requiresRegularFiles: true)
     }
     public func importPhotos(from source: URL) throws -> ImportReport {
+        try importPhotos(from: source, hooks: LibraryImportHooks())
+    }
+    func importPhotos(from source: URL, hooks: LibraryImportHooks) throws -> ImportReport {
         let source = source.standardizedFileURL
         let canonical = source.resolvingSymlinksInPath()
         guard source == canonical else { throw LibraryFiles.fail("Источник не может содержать символьные ссылки") }
@@ -194,14 +241,10 @@ public actor PhotoLibrary {
                 guard directory.path == directory.resolvingSymlinksInPath().path else { throw LibraryFiles.fail("Папка назначения содержит ссылку") }
                 if FileManager.default.fileExists(atPath: destination.path) {
                     // Recover a copy completed just before an interrupted manifest save.
-                    let metadata = try url.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey])
-                    let existing = try destination.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey])
-                    guard try LibraryFiles.hash(destination) == hash,
-                          try LibraryFiles.xattrs(destination) == LibraryFiles.xattrs(url),
-                          existing.creationDate == metadata.creationDate,
-                          existing.contentModificationDate == metadata.contentModificationDate else {
-                        throw LibraryFiles.fail("Конфликт существующего файла назначения: \(relative)")
-                    }
+                    let dates = try LibraryImportDates(url)
+                    let attributes = try hooks.attributes(url)
+                    try verifyImport(source: url, copy: destination, hash: hash, dates: dates,
+                                     attributes: attributes, relative: relative, hooks: hooks)
                     manifest.records.append(Record(source: sourceID, origin: identity, relative: relative, stored: stored, hash: hash, deleted: false))
                     do { try save(manifest) } catch { manifest.records.removeLast(); throw error }
                     report.imported += 1
@@ -210,15 +253,14 @@ public actor PhotoLibrary {
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
                 let temporary = directory.appendingPathComponent(".import-\(UUID().uuidString)")
                 defer { try? FileManager.default.removeItem(at: temporary) }
-                let metadata = try url.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey])
-                let attributes = try LibraryFiles.xattrs(url)
+                let dates = try LibraryImportDates(url)
+                let attributes = try hooks.attributes(url)
                 try FileManager.default.copyItem(at: url, to: temporary)
-                let copied = try temporary.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey])
-                guard try LibraryFiles.hash(temporary) == hash, try LibraryFiles.hash(url) == hash,
-                      try LibraryFiles.xattrs(temporary) == attributes,
-                      copied.creationDate == metadata.creationDate, copied.contentModificationDate == metadata.contentModificationDate else {
-                    throw LibraryFiles.fail("Не удалось сохранить содержимое или метаданные: \(relative)")
-                }
+                do { try hooks.restoreDates(dates, temporary) }
+                catch { throw LibraryFiles.fail("Не удалось сохранить даты: \(relative). \(error.localizedDescription)") }
+                try hooks.beforeVerification(temporary)
+                try verifyImport(source: url, copy: temporary, hash: hash, dates: dates,
+                                 attributes: attributes, relative: relative, hooks: hooks)
                 try FileManager.default.moveItem(at: temporary, to: destination)
                 manifest.records.append(Record(source: sourceID, origin: identity, relative: relative, stored: stored, hash: hash, deleted: false))
                 // Save after every file: earlier successful copies remain discoverable on later failure.
@@ -234,6 +276,18 @@ public actor PhotoLibrary {
         }
         report.issues += enumerationErrors
         return report
+    }
+    private func verifyImport(source: URL, copy: URL, hash: String, dates: LibraryImportDates,
+                              attributes: [String: Data], relative: String, hooks: LibraryImportHooks) throws {
+        guard try LibraryFiles.hash(copy) == hash, try LibraryFiles.hash(source) == hash else {
+            throw LibraryFiles.fail("Содержимое копии или источника изменилось: \(relative)")
+        }
+        guard try hooks.attributes(copy) == attributes else {
+            throw LibraryFiles.fail("Не удалось сохранить расширенные атрибуты: \(relative)")
+        }
+        guard try LibraryImportDates(copy) == dates else {
+            throw LibraryFiles.fail("Не удалось сохранить даты: \(relative)")
+        }
     }
     public func trash(_ asset: PhotoAsset) throws -> TrashReport {
         try trash(asset, move: { try FileManager.default.trashItem(at: $0, resultingItemURL: nil) })

@@ -224,11 +224,7 @@ import PhotoCore
                 let report = try await target.importPhotos(from: source)
                 finishOperation()
                 if location == .library(root) { await refresh() }
-                let alert = NSAlert()
-                alert.messageText = "Импорт завершён"
-                alert.informativeText = "Добавлено файлов: \(report.imported). Пропущено: \(report.skipped)." + (report.issues.isEmpty ? "" : "\n\n" + Self.summarizeIssues(report.issues))
-                alert.addButton(withTitle: "Открыть библиотеку").toolTip = "Открыть библиотеку с импортированными фотографиями"
-                alert.addButton(withTitle: "Закрыть").toolTip = "Закрыть отчёт об импорте"
+                let alert = Self.makeImportAlert(report)
                 if alert.runModal() == .alertFirstButtonReturn { navigate(.library(root)) }
             } catch {
                 finishOperation()
@@ -236,6 +232,22 @@ import PhotoCore
                 if location == .library(root) { await refresh() }
             }
         }
+    }
+    static func makeImportAlert(_ report: ImportReport) -> NSAlert {
+        let alert = NSAlert()
+        if report.issues.isEmpty {
+            alert.messageText = "Импорт завершён"
+            alert.alertStyle = .informational
+        } else {
+            alert.messageText = report.imported + report.skipped > 0
+                ? "Импорт завершён с ошибками" : "Не удалось импортировать фотографии"
+            alert.alertStyle = .warning
+        }
+        alert.informativeText = "Добавлено файлов: \(report.imported). Пропущено: \(report.skipped)."
+            + (report.issues.isEmpty ? "" : "\n\n" + summarizeIssues(report.issues))
+        alert.addButton(withTitle: "Открыть библиотеку").toolTip = "Открыть библиотеку с импортированными фотографиями"
+        alert.addButton(withTitle: "Закрыть").toolTip = "Закрыть отчёт об импорте"
+        return alert
     }
     func confirmTrash() {
         guard canTrash, location != nil else { return }
